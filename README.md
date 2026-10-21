@@ -7,39 +7,28 @@ on a Redmi Note 10 Pro, running the unmodified iPhone X iOS 16.7.16 userland) to
 original design, the 81 XNU patches, the shim and the tools goes to that project; this tree renames it and replaces the
 SoC-specific parts. The original engineering log is kept in `docs/UPSTREAM-sweet-NOTES.md`.
 
-> **Status: written, NOT built, NOT booted.** No part of this port has been compiled on a macOS runner or run on a
-> phone yet. Treat it as a careful first draft that will need a few CI/boot iterations. It installs into `userdata`
-> and **erases Android/postmarketOS user data**, and booting it means flashing the `boot` partition. Back up first.
-
 ## What was ported
 
-| Area | sweet (SM7150) | A13 (Exynos850) | State |
-| --- | --- | --- | --- |
-| Cores | 6x A55 via PSCI (A76s unused) | 8x Cortex-A55, MPIDR `0x000-3`, `0x100-3`, PSCI | ported (patch 0082) |
-| Interrupts | GICv3, timer INTID 19, `ICC_*` sysregs | GIC-400 = **GICv2**, timer INTID 27, MMIO `GICC_IAR/EOIR`, IPIs via `GICD_SGIR` | ported (0082) |
-| Timer | 19.2 MHz | 26 MHz (ADT `timebase-frequency`) | ported |
-| RAM | upper DDR bank at `0x100000000` | 2 GiB block at `0x880000000` | ported (`mkadt.py`) |
-| Display | ABL splash 1080x2400 @ `0x9c000000` | simple-framebuffer 1080x2408 @ `0xfa000000`, same CPU-copy path, shown centered in the 1125x2436 iPhone X canvas | ported (0082) |
-| Storage | own UFS host driver | own **DW-MSHC eMMC** driver (polled, IDMAC, reuses the bootloader's trained bus), root `rd=mmcroot0` | written, untested (0083) |
-| Boot | ABL + `fastboot boot` | Samsung bootloader: shim is **flashed to `boot`** (EL2->EL1 drop included) | ported (`shim/`) |
-| Keys | PMIC via SPMI | volume up/down on GPIO `gpa0-7`/`gpa1-0`; **both together = Power** | written (0084) |
-| Battery | PM6150 SPMI | static 100 % fallback (MAX1726x/S2MPU12 drivers not written) | stub |
-| Touch | Goodix over GENI I2C | TD4150: polled S3C64xx SPI (USI_CMGP0) + TCM client with zeroflash firmware download, firmware embedded in the ADT by `mkadt.py --touch-fw` | written, untested (0085) |
-| USB | Qualcomm DWC3 + QUSB2 | CMU_HSI gates + PMU isolation + Exynos850 UTMI PHY init (from mainline `phy-exynos5-usbdrd.c`), then the same DWC3 CDC-ECM/log gadget | written, untested (0085) |
-| Display enable | ABL splash | `DECON_F (0x13060000) + 0x70 = 0x1281`, written by the shim and again by the kernel | added (shim, 0085) |
-| GPU, audio, Wi-Fi, BT, modem, camera, PMIC | none | none | not planned |
+| Area | A13 (Exynos850) | State |
+| --- | --- | --- |
+| Cores | 8x Cortex-A55, MPIDR `0x000-3`, `0x100-3`, PSCI | ported (patch 0082) |
+| Interrupts | GIC-400 = **GICv2**, timer INTID 27, MMIO `GICC_IAR/EOIR`, IPIs via `GICD_SGIR` | ported (0082) |
+| Timer | 26 MHz (ADT `timebase-frequency`) | ported |
+| RAM | 2 GiB block at `0x880000000` | ported (`mkadt.py`) |
+| Display | simple-framebuffer 1080x2408 @ `0xfa000000`, same CPU-copy path, shown centered in the 1125x2436 iPhone X canvas | ported (0082) |
+| Storage | own dwmmc driver (polled, IDMAC, reuses the bootloader's trained bus), root `rd=mmcroot0` | written, untested (0083) |
+| Boot | SBOOT/UNILOADER: shim is flashed to `boot` (EL2->EL1 drop included), preferrably via fastboot | ported (`shim/`) |
+| Keys | volume up/down on GPIO `gpa0-7`/`gpa1-0`; **both together = Power** | written (0084) |
+| Battery | static 100 % fallback (MAX1726x/S2MPU12 drivers not written) | stub |
+| Touch | TD4150: polled S3C64xx SPI (USI_CMGP0) + TCM client with zeroflash firmware download, firmware embedded in the ADT by `mkadt.py --touch-fw` | written, untested (0085) |
+| USB | CMU_HSI gates + PMU isolation + Exynos850 UTMI PHY init (from mainline `phy-exynos5-usbdrd.c`), then the same DWC3 CDC-ECM/log gadget | written, untested (0085) |
+| Display enable | `DECON_F (0x13060000) + 0x70 = 0x1281`, written by the shim and again by the kernel | added (shim, 0085) |
+| GPU, audio, Wi-Fi, BT, modem, camera, PMIC | none | not planned yet |
 
 Generic parts (AMFI/entitlement stubs, HFS+, mockfs, IOSurface/AppleCLCD, HID event services, crash/log tooling,
 `mkiosroot.sh`, `a135f-root-tweaks.py`) are unchanged apart from renaming.
 
-## Rebrand
-
-`sweet` -> `a135f`, `SWEET` -> `A135F` everywhere (machine config `A135F`, `config/MASTER.arm64.a135f`,
-`pexpert/pexpert/arm64/A135F.h`, `A135F*.cpp` IOKit classes, boot-args `a135f_fb_hz`, `a135f_fb_noconsole`, `a135f_keys`,
-`a135f_touch`, `a135f_usb`, ADT nodes `a135f-fbcon` / `a135f-mmc`, payload magic `A135FXNU`, log magic `A135FLOG`).
-Change the name once in `tools/` + a `sed` over `xnu/patches` if you prefer another one.
-
-## How to use it (untested path)
+## How to use it
 
 You need an A13 with an **unlocked bootloader**, a Linux PC, a GitHub account (kernel build runs on macOS runners) and
 a boot.img that your phone already boots (your postmarketOS one is ideal).
@@ -49,6 +38,17 @@ a boot.img that your phone already boots (your postmarketOS one is ideal).
    `gh run download RUN_ID -n xnu-kernel -D xnu/out`. Expect compile errors on the first runs (`keep_going` collects them all).
 3. **Root image:** as upstream: `tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G`, then
    `tools/a135f-root-tweaks.py`. Needs the iPhone X (iPhone10,3) 16.7.16 IPSW from Apple.
+for the latest ios 16.7.16 ipsw (iphone x) off ipsw.me:
+```
+export IPSW_APFS_FUSE_PATH=/usr/local/bin/apfs-fuse
+
+tools/mkiosroot.sh \
+  ipsw-extracted/20H392__iPhone10,3_6/087-86698-044.dmg \
+  ipsw-extracted/20H392__iPhone10,3_6/087-86593-047.dmg \
+  ipsw-extracted/20H392__iPhone10,3_6/087-86715-047.dmg \
+  ios-root.img
+```
+
 4. **Payload and blobs:**
    ```sh
    python3 tools/mkadt.py shim/out/a135f.adt --touch-fw /path/to/td4375_a13_boe.bin   # vendor TCM image you load on Linux
