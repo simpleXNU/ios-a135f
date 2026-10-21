@@ -9,3 +9,7 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 out/
+*.img
+*.ipsw
+kernel.development.*
+kernel.*
