@@ -1,0 +1,2388 @@
+diff --git a/bsd/dev/a135f_keys.c b/bsd/dev/a135f_keys.c
+index 008c369..f1782a0 100644
+--- a/bsd/dev/a135f_keys.c
++++ b/bsd/dev/a135f_keys.c
+@@ -1,8 +1,14 @@
+ /*
+- * Minimal polled A135F keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * Polled hardware keys for the Galaxy A13 (Exynos850).
++ *
++ * Volume up is gpa0-7 and volume down is gpa1-0 on the ALIVE pin controller
++ * (0x11850000), both active low. The power key is wired to the S2MPU12 PMIC
++ * (ACPM), which has no driver here yet, so pressing both volume keys together
++ * is reported as Power (lock/wake) and suppresses the two volume events.
++ *
++ * The pins are only read; the function mux is switched from EINT to plain
++ * input so the DAT register reflects the pad. Call once after the scheduler
++ * is running.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ #include <sys/param.h>
+@@ -17,68 +23,44 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void a135f_hid_key(int key, int down);
+ void a135f_keys_init(void);
+ 
+-#define KEYS_CORE_PA     0x0c440000u
+-#define KEYS_OBS_PA      0x0e600000u
+-#define KEYS_CNFG_PA     0x0c40a000u
+-#define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
+-#define KEYS_NO_APID     0xffffu
++#define ALIVE_PA        0x11850000u
++#define GPA0            0x000u          /* bank: CON +0 (4 bits/pin), DAT +4 */
++#define GPA1            0x020u
++#define VOLUP_PIN       7               /* gpa0-7 */
++#define VOLDN_PIN       0               /* gpa1-0 */
++/* key indices understood by a135f_hid_key(): 0 power, 1 volume up, 2 volume down */
++#define KEY_POWER       0
++#define KEY_VOLUP       1
++#define KEY_VOLDN       2
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg;
+-static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+-static uint32_t keys_version, keys_last_status;
++static vm_offset_t keys_base;
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
+ static uint32_t
+-keys_rd(vm_offset_t base, uint32_t off)
++keys_rd(uint32_t off)
+ {
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
++	return *(volatile uint32_t *)(keys_base + off);
+ }
+ 
+-/* v5 can map one PPID more than once; prefer the apps-owned entry. */
+-static uint16_t
+-keys_find_apid(uint16_t ppid, uint32_t count)
++static void
++keys_wr(uint32_t off, uint32_t v)
+ {
+-	uint16_t found = KEYS_NO_APID;
+-	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
+-		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
+-		}
+-		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
+-		if (found == KEYS_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
+-		}
+-	}
+-	return found;
++	*(volatile uint32_t *)(keys_base + off) = v;
++}
++
++static void
++keys_make_input(uint32_t bank, unsigned pin)
++{
++	uint32_t con = keys_rd(bank);
++	con &= ~(0xfu << (pin * 4));    /* function 0 = input */
++	keys_wr(bank, con);
+ }
+ 
+ static bool
+-keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
++keys_down(uint32_t bank, unsigned pin)
+ {
+-	if (apid == KEYS_NO_APID) {
+-		return false;
+-	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+-	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		keys_last_status = keys_rd(keys_obs, off + 0x08u);
+-		if (keys_last_status & 1u) {
+-			if (keys_last_status & 0x0eu) {
+-				return false;
+-			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
++	return !((keys_rd(bank + 4) >> pin) & 1u);      /* active low */
+ }
+ 
+ static void
+@@ -93,29 +75,39 @@ keys_wait(void)
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int state[3] = {0, 0, 0};
+-	unsigned errors = 0;
++	bool up_sent = false, dn_sent = false, chord = false;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0, gpio = 0;
+-		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
+-			if ((errors++ % 250u) == 0) {
+-				printf("A135F KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+-				    pok, gok, keys_last_status);
++		bool up = keys_down(GPA0, VOLUP_PIN), dn = keys_down(GPA1, VOLDN_PIN);
++		if (up && dn) {
++			if (!chord) {
++				chord = true;
++				if (up_sent) {
++					a135f_hid_key(KEY_VOLUP, 0);
++					up_sent = false;
++				}
++				if (dn_sent) {
++					a135f_hid_key(KEY_VOLDN, 0);
++					dn_sent = false;
++				}
++				printf("A135F KEYS: volume up+down chord -> power down\n");
++				a135f_hid_key(KEY_POWER, 1);
++			}
++		} else if (chord) {
++			if (!up && !dn) {
++				chord = false;
++				printf("A135F KEYS: chord released -> power up\n");
++				a135f_hid_key(KEY_POWER, 0);
+ 			}
+ 		} else {
+-			errors = 0;
+-		}
+-		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+-				state[k] = now[k];
+-				printf("A135F KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+-				    k, state[k], pon, gpio);
+-				a135f_hid_key(k, state[k]);
++			if (up != up_sent) {
++				up_sent = up;
++				a135f_hid_key(KEY_VOLUP, up);
++			}
++			if (dn != dn_sent) {
++				dn_sent = dn;
++				a135f_hid_key(KEY_VOLDN, dn);
+ 			}
+ 		}
+ 		keys_wait();
+@@ -136,42 +128,14 @@ a135f_keys_init(void)
+ 		printf("A135F KEYS: disabled (a135f_keys=0)\n");
+ 		return;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
++	keys_base = ml_io_map(ALIVE_PA, 0x1000);
++	if (!keys_base) {
+ 		printf("A135F KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+-	keys_version = keys_rd(keys_core, 0);
+-	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+-	    count == 0 || count > 512) {
+-		printf("A135F KEYS: unsupported arbiter version=%#x apids=%u\n",
+-		    keys_version, count);
+-		return;
+-	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+-	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("A135F KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("A135F KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+-		keys_gpio_apid = KEYS_NO_APID;
+-	}
+-	if (!pok && !gok) {
+-		printf("A135F KEYS: no readable keys; polling retained for recovery\n");
+-	}
++	keys_make_input(GPA0, VOLUP_PIN);
++	keys_make_input(GPA1, VOLDN_PIN);
++	printf("A135F KEYS: gpa0 dat 0x%x gpa1 dat 0x%x\n", keys_rd(GPA0 + 4), keys_rd(GPA1 + 4));
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/bsd/dev/a135f_rpmh.c b/bsd/dev/a135f_rpmh.c
+deleted file mode 100644
+index 647a67c..0000000
+--- a/bsd/dev/a135f_rpmh.c
++++ /dev/null
+@@ -1,358 +0,0 @@
+-/*
+- * A135F PM6150L L11C bring-up; see report.md for DT and source evidence.
+- * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+- * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
+- */
+-#if defined(ARM64_BOARD_CONFIG_A135F)
+-#include <sys/param.h>
+-#include <sys/systm.h>
+-#include <sys/errno.h>
+-#include <kern/clock.h>
+-#include <machine/machine_routines.h>
+-
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-int a135f_rpmh_vreg_enable(const char *res, unsigned mv);
+-
+-/* Live downstream DT has two positional reg entries, no reg-names. */
+-#define RH_RSC_PA       0x18220000u
+-#define RH_TCS_PA       0x18220d00u
+-#define RH_TCS_SIZE     0x3000u
+-#define RH_DICT_PA      0x0c3f000cu
+-#define RH_DRV          2u
+-#define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
+-#define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+-#define RH_TCS_STRIDE   0x2a0u
+-#define RH_CMD_STRIDE   0x14u
+-#define RH_IRQ_EN       0x00u
+-#define RH_IRQ_STATUS   0x04u
+-#define RH_IRQ_CLEAR    0x08u
+-#define RH_WAIT         0x10u
+-#define RH_CONTROL      0x14u
+-#define RH_STATUS       0x18u
+-#define RH_ENABLE       0x1cu
+-#define RH_MSGID        0x30u
+-#define RH_ADDR         0x34u
+-#define RH_DATA         0x38u
+-#define RH_CMD_STATUS   0x3cu
+-#define RH_AMC_EN       (1u << 16)
+-#define RH_TRIGGER      (1u << 24)
+-#define RH_ISSUED       (1u << 8)
+-#define RH_COMPLETE     (1u << 16)
+-#define RH_WRITE_ACK    (8u | (1u << 8) | (1u << 16))
+-#define RH_DB_MAGIC     0x0c0330dbu
+-#define RH_DB_HEADER    144u
+-#define RH_DB_ENTRY     24u
+-#define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+-#define RH_VRM          4u
+-#define RH_TIMEOUT_US   100000u
+-
+-static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+-static uint32_t rh_db_size;
+-static unsigned rh_ncpt;
+-static unsigned rh_lock;
+-static bool rh_poisoned;
+-
+-static uint32_t
+-rh_read(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
+-}
+-
+-static void
+-rh_write(vm_offset_t base, uint32_t off, uint32_t value)
+-{
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = value;
+-	__asm__ volatile("dsb osh" ::: "memory");
+-}
+-
+-static bool
+-rh_sync(uint32_t off, uint32_t value)
+-{
+-	rh_write(rh_tcs, off, value);
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		if (rh_read(rh_tcs, off) == value) {
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	printf("A135F RPMH: readback timeout off=%#x want=%#x got=%#x\n",
+-	    off, value, rh_read(rh_tcs, off));
+-	return false;
+-}
+-
+-/* DB is little endian; avoid packed structs and unaligned Device loads. */
+-static uint16_t
+-rh_db16(uint32_t off)
+-{
+-	uint32_t v = rh_read(rh_db, off & ~3u);
+-	return (uint16_t)(v >> (8u * (off & 3u)));
+-}
+-
+-static bool
+-rh_range(uint32_t off, uint32_t size)
+-{
+-	return off <= rh_db_size && size <= rh_db_size - off;
+-}
+-
+-static int
+-rh_map(void)
+-{
+-	if (!rh_rsc) {
+-		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
+-	}
+-	if (!rh_tcs) {
+-		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
+-	}
+-	if (!rh_dict) {
+-		rh_dict = ml_io_map(RH_DICT_PA, 8);
+-	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
+-		printf("A135F RPMH: RSC/locator mapping failed\n");
+-		return ENOMEM;
+-	}
+-	uint32_t id = rh_read(rh_rsc, 0);
+-	uint32_t solver = rh_read(rh_rsc, 4);
+-	uint32_t config = rh_read(rh_rsc, 0x0c);
+-	unsigned major = (id >> 16) & 0xffu;
+-	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+-	rh_ncpt = (config >> 27) & 0x1fu;
+-	printf("A135F RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+-	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
+-	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+-	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+-	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+-	    count > RH_TCS_SIZE / RH_TCS_STRIDE || rh_ncpt < 3 || rh_ncpt > 16) {
+-		printf("A135F RPMH: unsupported RSC geometry/revision\n");
+-		return ENODEV;
+-	}
+-	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("A135F RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
+-		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+-		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+-		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+-		    (uint64_t)pa + size > 0x100000000ULL) {
+-			printf("A135F RPMH: invalid cmd-db locator\n");
+-			return EINVAL;
+-		}
+-		rh_db = ml_io_map(pa, size);
+-		if (!rh_db) {
+-			return ENOMEM;
+-		}
+-		rh_db_size = size;
+-	}
+-	uint32_t db_version = rh_read(rh_db, 0);
+-	uint32_t magic = rh_read(rh_db, 4);
+-	uint32_t flags = rh_read(rh_db, 140);
+-	printf("A135F RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
+-	    db_version, magic, rh_read(rh_db, 136), flags);
+-	/* Linux only checks magic; version 1 is an intentionally stricter policy. */
+-	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+-		printf("A135F RPMH: unsupported/standalone cmd-db\n");
+-		return EINVAL;
+-	}
+-	return 0;
+-}
+-
+-static int
+-rh_lookup(const char *res, uint32_t *address)
+-{
+-	uint32_t key[2] = {0, 0};
+-	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+-		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
+-	}
+-	unsigned matches = 0;
+-	for (unsigned i = 0; i < 8; ++i) {
+-		uint32_t h = 8u + 16u * i;
+-		unsigned slave = rh_db16(h);
+-		if (!slave) {
+-			break;
+-		}
+-		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+-		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
+-		unsigned count = rh_db16(h + 6);
+-		if (slave < 3 || slave > 5 || (entries & 3u) ||
+-		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
+-			printf("A135F RPMH: malformed cmd-db slave header %u\n", i);
+-			return EINVAL;
+-		}
+-		for (unsigned j = 0; j < count; ++j) {
+-			uint32_t e = entries + RH_DB_ENTRY * j;
+-			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
+-				continue;
+-			}
+-			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+-			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("A135F RPMH: invalid VRM entry for %s\n", res);
+-				return EINVAL;
+-			}
+-			*address = addr;
+-			++matches;
+-			printf("A135F RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+-			    res, addr, slave, rh_db16(h + 8),
+-			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+-		}
+-	}
+-	if (matches != 1) {
+-		printf("A135F RPMH: %s lookup matches=%u; refusing\n", res, matches);
+-		return ENODEV;
+-	}
+-	return 0;
+-}
+-
+-static bool
+-rh_free(unsigned t)
+-{
+-	uint32_t b = t * RH_TCS_STRIDE;
+-	/* Idle alone is insufficient: a sleep/wake payload can be armed and idle. */
+-	return rh_read(rh_tcs, b + RH_STATUS) != 0 &&
+-	    rh_read(rh_tcs, b + RH_STATUS) != 0xffffffffu &&
+-	    rh_read(rh_tcs, b + RH_CONTROL) == 0 &&
+-	    rh_read(rh_tcs, b + RH_ENABLE) == 0 &&
+-	    rh_read(rh_tcs, b + RH_WAIT) == 0 &&
+-	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+-}
+-
+-static int
+-rh_send(uint32_t address, unsigned mv)
+-{
+-	int chosen = -1;
+-	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+-		uint32_t b = t * RH_TCS_STRIDE;
+-		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+-		printf("A135F RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
+-		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
+-		    enabled, rh_read(rh_tcs, b + RH_WAIT));
+-		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+-			return EIO;
+-		}
+-		for (unsigned c = 0; c < rh_ncpt; ++c) {
+-			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("A135F RPMH: conflicting inherited L11C request in TCS%u\n", t);
+-				return EBUSY;
+-			}
+-		}
+-		if (chosen < 0 && rh_free(t)) {
+-			chosen = (int)t;
+-		}
+-	}
+-	if (chosen < 0) {
+-		printf("A135F RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
+-		return EBUSY;
+-	}
+-	unsigned t = (unsigned)chosen;
+-	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
+-	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
+-	if (irq_en == 0xffffffffu || !rh_free(t)) {
+-		return EBUSY;
+-	}
+-	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
+-	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
+-		rh_poisoned = true;
+-		return EIO;
+-	}
+-	if (!rh_free(t)) {
+-		/* No payload was touched. Do not acknowledge somebody else's IRQ. */
+-		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
+-			rh_poisoned = true;
+-		}
+-		return EBUSY;
+-	}
+-	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+-	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("A135F RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
+-		uint32_t cmd = b + c * RH_CMD_STRIDE;
+-		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+-		    !rh_sync(cmd + RH_DATA, values[c])) {
+-			return EIO;
+-		}
+-	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
+-	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+-		return EIO;
+-	}
+-	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
+-	bool done = false, progress = false;
+-	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+-		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+-		idle = rh_read(rh_tcs, b + RH_STATUS);
+-		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
+-			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+-			complete &= status[c] != 0xffffffffu &&
+-			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+-		}
+-		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
+-		progress |= idle == 0 || !complete;
+-		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
+-		    ((irq & bit) || progress) && complete) {
+-			done = true;
+-			break;
+-		}
+-		delay(1);
+-	}
+-	printf("A135F RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
+-	if (!done) {
+-		printf("A135F RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+-		return ETIMEDOUT;
+-	}
+-	/* Proven completion: clear trigger before mode, then free only our commands. */
+-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
+-	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+-		return EIO;
+-	}
+-	rh_write(rh_tcs, RH_IRQ_CLEAR, bit); /* W1C: never clear other TCS bits */
+-	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
+-	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
+-		return EIO;
+-	}
+-	rh_poisoned = false;
+-	printf("A135F RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
+-	return 0;
+-}
+-
+-int
+-a135f_rpmh_vreg_enable(const char *res, unsigned mv)
+-{
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("A135F RPMH: expected ldoc11 and 2950..3400 mV\n");
+-		return EINVAL;
+-	}
+-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+-		return EBUSY;
+-	}
+-	int error = EIO;
+-	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("A135F RPMH: previous uncertain transaction; refusing further access\n");
+-		goto out;
+-	}
+-	error = rh_map();
+-	if (!error) {
+-		error = rh_lookup(res, &address);
+-	}
+-	if (!error) {
+-		error = rh_send(address, mv);
+-	}
+-out:
+-	if (error) {
+-		printf("A135F RPMH: enable failed errno=%d\n", error);
+-	}
+-	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+-	return error;
+-}
+-#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/bsd/dev/a135f_spmi.c b/bsd/dev/a135f_spmi.c
+deleted file mode 100644
+index 0a91c25..0000000
+--- a/bsd/dev/a135f_spmi.c
++++ /dev/null
+@@ -1,126 +0,0 @@
+-/*
+- * Battery-only adaptation of input/a135f_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in A135FBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+- */
+-#if defined(ARM64_BOARD_CONFIG_A135F)
+-#include <sys/param.h>
+-#include <sys/systm.h>
+-#include <machine/machine_routines.h>
+-#include <IOKit/IOLocks.h>
+-#include "a135f_spmi.h"
+-
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
+-#define SP_NO_APID 0xffffu
+-
+-static vm_offset_t sp_core, sp_obs, sp_cfg;
+-static IOLock *sp_lock;
+-static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
+-/* A timed-out command may complete late: never reuse that lane this boot. */
+-static bool sp_poisoned[512];
+-
+-static uint32_t
+-sp_rd(vm_offset_t base, unsigned off)
+-{
+-	uint32_t value = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return value;
+-}
+-
+-static uint16_t
+-sp_find_apid(unsigned ppid)
+-{
+-	uint16_t found = SP_NO_APID;
+-	for (unsigned i = 0; i < sp_count; ++i) {
+-		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
+-		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
+-		}
+-		unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * i) & 7u;
+-		if (found == SP_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
+-		}
+-	}
+-	return found;
+-}
+-
+-int
+-a135f_spmi_init(void)
+-{
+-	if (sp_attempted) {
+-		return sp_ready ? 0 : -1;
+-	}
+-	sp_attempted = true;
+-	sp_lock = IOLockAlloc();
+-	if (!sp_lock) {
+-		return -1;
+-	}
+-	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+-	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+-	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+-	if (!sp_core || !sp_cfg || !sp_obs) {
+-		printf("A135F BATTERY: SPMI mapping failed\n");
+-		return -1;
+-	}
+-	uint32_t arb_version = sp_rd(sp_core, 0);
+-	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+-	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
+-	    !sp_count || sp_count > 512) {
+-		printf("A135F BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+-		    arb_version, sp_count);
+-		return -1;
+-	}
+-	sp_ready = true;
+-	printf("A135F BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
+-	return 0;
+-}
+-
+-int
+-a135f_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+-{
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
+-	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
+-		return -1;
+-	}
+-	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+-	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
+-		return -1;
+-	}
+-	unsigned off = 0x80u * apid;
+-	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+-		if (status & 1u) {
+-			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
+-				return -1;
+-			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
+-			return 0;
+-		}
+-		delay(1);
+-	}
+-	sp_poisoned[apid] = true;
+-	printf("A135F BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+-	    sid, addr, apid);
+-	IOLockUnlock(sp_lock);
+-	return -1;
+-}
+-#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/bsd/dev/a135f_spmi.h b/bsd/dev/a135f_spmi.h
+deleted file mode 100644
+index ecd74fd..0000000
+--- a/bsd/dev/a135f_spmi.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/* Shared C/C++ interface. Init once, on the A135FBattery start thread. */
+-#ifndef A135F_BATTERY_SPMI_H
+-#define A135F_BATTERY_SPMI_H
+-#include <stdint.h>
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-int a135f_spmi_init(void);
+-/* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+-int a135f_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+-#ifdef __cplusplus
+-}
+-#endif
+-#endif
+diff --git a/bsd/dev/a135f_touch.c b/bsd/dev/a135f_touch.c
+index 92f4f7a..4ba6025 100644
+--- a/bsd/dev/a135f_touch.c
++++ b/bsd/dev/a135f_touch.c
+@@ -1,660 +1,26 @@
+ /*
+- * A135F SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
+- * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware; votes L11C through a135f_rpmh.c.
+- * No firmware/config upload or direct PMIC writes. Only IC data write:
+- * zero to GT9896's event status after reading a report. See touch2/report.md.
++ * Touchscreen for the Galaxy A13: placeholder.
++ *
++ * The panel's controller (Omnivision/Synaptics TCM "TD4150" TDDI) is a SPI
++ * part (USI_CMGP0 / spi_1, 0x11d00000, CS gpm3-0, IRQ gpa0-0, mode 3,
++ * <= 7 MHz) that needs its firmware downloaded by the host on every cold
++ * boot ("zeroflash"). That needs the vendor ovt_tcm protocol sources and the
++ * firmware image, which this tree does not have yet. Until a driver exists
++ * the HID touch service stays idle (the volume keys still work).
++ *
++ * The driver should feed the HID layer with
++ *     void a135f_hid_touch(int finger, int down, int x, int y);
++ * using coordinates in the 1080x2408 panel space.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+-#include <sys/errno.h>
+-#include <kern/clock.h>
+-#include <kern/thread.h>
+-#include <kern/sched_prim.h>
+-#include <machine/machine_routines.h>
+-#include <pexpert/pexpert.h>
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-/* Mach MIG declaration is not included by BSD's exported thread.h. */
+-extern kern_return_t thread_terminate(thread_t);
+-extern int a135f_rpmh_vreg_enable(const char *res, unsigned mv);
+-extern void a135f_hid_touch(int finger, int down, int x, int y);
+ void a135f_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
+-#define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
+-#define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+-#define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+-#define TOUCH_MAX        10u
+-#define TOUCH_GOODIX     1
+-#define TOUCH_FTS        2
+-/* GT9896 is Yellowstone in Xiaomi a135f-r-oss, not the Berlin protocol. */
+-#define GOODIX_PID_REG   0x4022u
+-#define GOODIX_EVENT_REG 0x4180u
+-#define GOODIX_HEAD_LEN  8u
+-#define GOODIX_POINT_LEN 8u
+-
+-#define SE_STATUS       0x040u
+-#define SE_MCLK         0x048u
+-#define SE_FW           0x068u
+-#define SE_CLK_SEL      0x07cu
+-#define SE_DMA          0x258u
+-#define SE_TX_LEN       0x26cu
+-#define SE_RX_LEN       0x270u
+-#define SE_SCL          0x278u
+-#define SE_CMD          0x600u
+-#define SE_CTRL         0x604u
+-#define SE_IRQ          0x610u
+-#define SE_IRQ_EN       0x614u
+-#define SE_IRQ_CLR      0x618u
+-#define SE_TX           0x700u
+-#define SE_RX           0x780u
+-#define SE_TX_COUNT     0x800u
+-#define SE_RX_COUNT     0x804u
+-#define SE_HW_TX        0xe24u
+-#define SE_HW_RX        0xe28u
+-#define SE_TX_WM        0x80cu
+-#define SE_RX_WM_IRQ    (1u << 26)
+-#define SE_RX_LAST      (1u << 27)
+-#define SE_TX_WM_IRQ    (1u << 30)
+-#define SE_DONE         (1u << 0)
+-#define SE_NACK         (1u << 10)
+-#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
+-                         (1u << 13) | (3u << 24) | (3u << 28))
+-#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
+-/* geni_se_config_packing(8, 4, true, true, true): start bits 7/15/23/31,
+- * MSB-to-LSB, length 8, STOP only on vector 3. FIFO bytes remain LSB first. */
+-#define SE_PACK0        0x0007f8feu
+-#define SE_PACK1        0x000ffefeu
+-
+-static struct {
+-	vm_offset_t se, gcc, gpio;
+-	bool started, dead, probing;
+-	int kind, irq_hint;
+-	uint32_t irq_status, irq_last, active;
+-	unsigned sent, got;
+-	int x[TOUCH_MAX], y[TOUCH_MAX];
+-} st;
+-static int touch_sleep_chan;
+-
+-static uint32_t
+-touch_rd(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
+-}
+-
+-static void
+-touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
+-{
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = val;
+-	__asm__ volatile("dsb osh" ::: "memory");
+-}
+-
+-static void
+-touch_wait(unsigned ms)
+-{
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
+-	thread_block(THREAD_CONTINUE_NULL);
+-}
+-
+-static bool
+-touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
+-{
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (!(touch_rd(base, off) & mask)) {
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
+-}
+-
+-static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
+-{
+-	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
+-	if (out) {
+-		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+-	}
+-	cfg &= ~0x3ffu;
+-	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
+-}
+-
+-static bool
+-touch_clocks(void)
+-{
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+-	printf("A135F TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
+-	if (dfs & 1u) {
+-		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
+-		if ((cfg & 0x371fu) != 1u) {
+-			printf("A135F TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+-			return false;
+-		}
+-	} else {
+-		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+-		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
+-			printf("A135F TOUCH: RCG update timeout\n");
+-			return false;
+-		}
+-	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("A135F TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
+-		}
+-	}
+-	return true;
+-}
+-
+-/* Called only for a transfer started by this driver, including a stretched TX. */
+-static void
+-touch_abort(void)
+-{
+-	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
+-	bool done = false;
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
+-			done = true;
+-			break;
+-		}
+-		delay(1);
+-	}
+-	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true;
+-		printf("A135F TOUCH: abort failed status=%#x irq=%#x; stopping\n",
+-		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
+-	}
+-	/* Bound drain even if the hardware reports an impossible FIFO count. */
+-	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+-		(void)touch_rd(st.se, SE_RX);
+-	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
+-		st.dead = true;
+-		printf("A135F TOUCH: TX FIFO not empty after abort; stopping\n");
+-	}
+-}
+-
+-/* Keep all observed bits for diagnostics, even if a watermark was cleared. */
+-static uint32_t
+-touch_irq(void)
+-{
+-	st.irq_last = touch_rd(st.se, SE_IRQ);
+-	st.irq_status |= st.irq_last;
+-	return st.irq_last;
+-}
+-
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
+-static int
+-touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
+-{
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+-		return EIO;
+-	}
+-	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true; /* no other SE7 owner is supported */
+-		return EBUSY;
+-	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
+-	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+-	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+-	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+-	int err = ETIMEDOUT;
+-	for (unsigned i = 0; i < 20000; ++i) {
+-		uint32_t irq = touch_irq();
+-		if (irq & SE_ERRORS) {
+-			err = (irq & SE_NACK) ? ENXIO : EIO;
+-			/* A completed NACK is normal during address probing. Aborting an
+-			 * idle sequencer may never produce ABORT_DONE. Wait for completion
+-			 * and leave a clean idle engine available for the other IC. */
+-			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
+-				delay(1);
+-				irq = touch_irq();
+-			}
+-			if ((irq & SE_DONE) && !(touch_rd(st.se, SE_STATUS) & 1u) &&
+-			    !(touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
+-			    !(touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-				touch_wr(st.se, SE_IRQ_CLR, irq);
+-				return err;
+-			}
+-			break;
+-		}
+-		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
+-			}
+-			touch_wr(st.se, SE_TX, word);
+-			st.sent = nt;
+-			touch_wr(st.se, SE_TX_WM, 0);
+-		}
+-		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
+-		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
+-			err = EIO;
+-			break;
+-		}
+-		while (count--) {
+-			uint32_t word = touch_rd(st.se, SE_RX);
+-			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
+-				rx[st.got++] = (uint8_t)(word >> (8u * j));
+-			}
+-		}
+-		/* DONE is checked after draining RX, so final short words aren't lost. */
+-		if (irq & SE_DONE) {
+-			/* Re-sample after the final drain; a late error must beat DONE. */
+-			irq = touch_irq();
+-			if (irq & SE_ERRORS) {
+-				continue;
+-			}
+-			touch_wr(st.se, SE_IRQ_CLR, irq);
+-			if (st.got == nr && st.sent == nt) {
+-				return 0;
+-			}
+-			err = EIO;
+-			break;
+-		}
+-		/* Preserve DONE/errors if they arrive during this iteration. */
+-		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
+-		delay(1);
+-	}
+-	touch_abort();
+-	return err;
+-}
+-
+-static int
+-touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
+-{
+-	st.irq_status = st.irq_last = 0;
+-	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+-	if (st.probing) {
+-		printf("A135F TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+-		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+-		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    touch_rd(st.se, SE_STATUS));
+-	}
+-	return err;
+-}
+-
+-static int
+-touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
+-{
+-	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
+-	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+-	    NULL, 0, true);
+-	if (err) {
+-		return err;
+-	}
+-	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
+-	return touch_msg(addr, NULL, 0, buf, len, false);
+-}
+-
+-static int
+-touch_goodix_ack(void)
+-{
+-	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+-	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
+-}
+-
+-/* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+- * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+- * on this 16-bit IC the extra bytes would be register data writes. */
+-static int
+-touch_probe_info(uint16_t reg, uint8_t *buf)
+-{
+-	memset(buf, 0xa5, 32);
+-	int err = touch_read(0x5d, reg, true, buf, 32);
+-	printf("A135F TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+-	    reg, err, st.irq_last, st.irq_status);
+-	if (!err) {
+-		for (unsigned off = 0; off < 32; off += 16) {
+-			char line[49];
+-			for (unsigned j = 0; j < 16; ++j) {
+-				(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
+-			}
+-			printf("A135F TOUCH: probe raw %#x: %s\n", reg + off, line);
+-		}
+-	}
+-	return err;
+-}
+-
+-static unsigned
+-touch_be16(const uint8_t *p)
+-{
+-	return ((unsigned)p[0] << 8) | p[1];
+-}
+-
+-static bool
+-touch_checksum(const uint8_t *buf, unsigned len)
+-{
+-	if (len < 2) {
+-		return false;
+-	}
+-	unsigned sum = 0;
+-	for (unsigned i = 0; i + 2 < len; ++i) {
+-		sum += buf[i];
+-	}
+-	return (sum & 0xffffu) == touch_be16(buf + len - 2);
+-}
+-
+-static void
+-touch_report(uint32_t mask, const int *x, const int *y)
+-{
+-	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+-		uint32_t bit = 1u << id;
+-		if (mask & bit) {
+-			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
+-				a135f_hid_touch((int)id, 1, x[id], y[id]);
+-			}
+-			st.x[id] = x[id];
+-			st.y[id] = y[id];
+-		} else if (st.active & bit) {
+-			a135f_hid_touch((int)id, 0, st.x[id], st.y[id]);
+-		}
+-	}
+-	st.active = mask;
+-}
+-
+-static int
+-touch_goodix(void)
+-{
+-	uint8_t buf[90];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0;
+-	int err = touch_read(0x5d, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
+-	if (err) {
+-		return err;
+-	}
+-	if (!(buf[0] & 0x80u)) {
+-		/* Do not acknowledge firmware/config requests that we cannot service. */
+-		if (buf[0] & 0x40u) {
+-			return ENOTSUP;
+-		}
+-		return 0; /* no new touch frame: retain current contacts */
+-	}
+-	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+-		return EIO; /* header untrusted: no write to the IC */
+-	}
+-	unsigned n = buf[2] & 15u;
+-	if (n > TOUCH_MAX) {
+-		(void)touch_goodix_ack();
+-		return EIO;
+-	}
+-	if (n) {
+-		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+-		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
+-		if (err) {
+-			return err;
+-		}
+-		if (!touch_checksum(buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u)) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-	}
+-	for (unsigned i = 0; i < n; ++i) {
+-		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
+-		unsigned id = p[0] >> 4;
+-		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+-		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+-		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-	}
+-	err = touch_goodix_ack();
+-	if (!err) {
+-		touch_report(mask, x, y);
+-	}
+-	return err;
+-}
+-
+-static int
+-touch_focaltech(void)
+-{
+-	uint8_t buf[63];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
+-	if (err) {
+-		return err;
+-	}
+-	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+-		return EIO;
+-	}
+-	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+-		const uint8_t *p = buf + 3u + 6u * i;
+-		unsigned id = p[2] >> 4, event = p[0] >> 6;
+-		if (id >= TOUCH_MAX) {
+-			break; /* vendor's unused-record sentinel */
+-		}
+-		if (seen & (1u << id)) {
+-			return EIO;
+-		}
+-		seen |= 1u << id;
+-		if (event == 1u) {
+-			continue; /* UP record */
+-		}
+-		if (event == 3u) {
+-			return EIO;
+-		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-		++active;
+-	}
+-	if (active != n) {
+-		return EIO;
+-	}
+-	touch_report(mask, x, y);
+-	return 0;
+-}
+-
+-static bool
+-touch_se_init(void)
+-{
+-	uint32_t fw = touch_rd(st.se, SE_FW);
+-	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("A135F TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+-	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+-	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+-	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("A135F TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+-		return false;
+-	}
+-	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("A135F TOUCH: SE7 already busy; probes skipped\n");
+-		return false;
+-	}
+-	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+-	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
+-	touch_wr(st.se, 0x644, 0);
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, 0x648, 0xffffffffu);
+-	touch_wr(st.se, SE_DMA, 0);
+-	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+-	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+-	touch_wr(st.se, 0x24, 0x7f);
+-	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+-	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+-	touch_wr(st.se, 0x254, 0);
+-	touch_wr(st.se, 0x260, SE_PACK0);
+-	touch_wr(st.se, 0x264, SE_PACK1);
+-	touch_wr(st.se, 0x284, SE_PACK0);
+-	touch_wr(st.se, 0x288, SE_PACK1);
+-	touch_wr(st.se, SE_TX_WM, 0);
+-	touch_wr(st.se, 0x810, 0);
+-	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+-	printf("A135F TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+-	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
+-	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
+-	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x254) != 0) {
+-		printf("A135F TOUCH: packing readback mismatch; probes skipped\n");
+-		return false;
+-	}
+-	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
+-	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-		printf("A135F TOUCH: inherited FIFO data; probes skipped\n");
+-		return false;
+-	}
+-	return true;
+-}
+-
+-static void
+-touch_thread(void *arg, wait_result_t result)
+-{
+-	unsigned delay_s = 45;
+-	(void)arg;
+-	(void)result;
+-	/*
+-	 * Start late (boot-arg a135f_touchdelay, seconds): if the bus access
+-	 * below hangs the SoC, the persistent log and the GUI got there first.
+-	 */
+-	(void)PE_parse_boot_argn("a135f_touchdelay", &delay_s, sizeof(delay_s));
+-	printf("A135F TOUCH: starting in %u s\n", delay_s);
+-	touch_wait(delay_s * 1000u);
+-	printf("A135F TOUCH: mapping GCC/TLMM/SE7\n");
+-	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+-	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.gpio || !st.se) {
+-		printf("A135F TOUCH: MMIO mapping failed\n");
+-		goto out;
+-	}
+-	if (!touch_clocks() || !touch_se_init()) {
+-		goto out;
+-	}
+-	printf("A135F TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+-	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+-	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	int power_error = a135f_rpmh_vreg_enable("ldoc11", 3200);
+-	if (power_error) {
+-		printf("A135F TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
+-		goto out;
+-	}
+-	touch_gpio(90, 0, 0, 0, true, true); /* board digital power enable */
+-	touch_wait(10); /* conservative rail settling; not a DT timing value */
+-	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+-	touch_gpio(7, 1, 0, 0, false, false);
+-	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+-	touch_gpio(8, 0, 3, 3, true, false);
+-	touch_wait(2);
+-	touch_gpio(8, 0, 3, 3, true, true);
+-	touch_wait(300); /* exceeds vendor 5 ms test + 95 ms post-test wait */
+-	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
+-	st.probing = true;
+-	int ge = touch_probe_info(GOODIX_PID_REG, gid);
+-	printf("A135F TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
+-	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
+-	(void)touch_probe_info(0x8240, legacy);
+-	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
+-	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
+-	printf("A135F TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
+-	    fe1, fe2, fid1, fid2, st.irq_status);
+-	st.probing = false;
+-	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
+-	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
+-	if (st.dead || goodix == fts) {
+-		printf("A135F TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
+-		    goodix, fts, st.dead);
+-		goto out;
+-	}
+-	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("A135F TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
+-	unsigned errors = 0, ticks = 0;
+-	while (!st.dead) {
+-		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
+-			if (err) {
+-				if ((errors++ % 100u) == 0) {
+-					printf("A135F TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+-				}
+-				if (errors == 10) {
+-					touch_report(0, st.x, st.y); /* release after persistent bad reads */
+-				}
+-			} else {
+-				errors = 0;
+-			}
+-		}
+-		touch_wait(10);
+-	}
+-	touch_report(0, st.x, st.y);
+-out:
+-	(void)thread_terminate(current_thread());
+-	thread_block(THREAD_CONTINUE_NULL);
+-}
+-
+ void
+ a135f_touch_init(void)
+ {
+-	int enabled = 1;
+-	thread_t thread;
+-	if (st.started) {
+-		return;
+-	}
+-	st.started = true;
+-	(void)PE_parse_boot_argn("a135f_touch", &enabled, sizeof(enabled));
+-	(void)PE_parse_boot_argn("a135f_touchirq", &st.irq_hint, sizeof(st.irq_hint));
+-	if (!enabled) {
+-		printf("A135F TOUCH: disabled (a135f_touch=0)\n");
+-		return;
+-	}
+-	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+-	if (kr == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	} else {
+-		printf("A135F TOUCH: kernel_thread_start failed %d\n", kr);
+-	}
++	printf("A135F TOUCH: no driver for the TD4150 SPI/TCM controller yet; touch disabled\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/bsd/dev/a135f_usb.c b/bsd/dev/a135f_usb.c
+index 200768b..2a645e2 100644
+--- a/bsd/dev/a135f_usb.c
++++ b/bsd/dev/a135f_usb.c
+@@ -1,931 +1,27 @@
+ /*
+- * A135F: USB bring-up, step 1 - read-only state probe.
++ * USB device mode (CDC-ECM networking + live log) for the Galaxy A13: placeholder.
+  *
+- * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+- * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
+- * controller for fastboot; this probe only reports what state it is left
+- * in after `fastboot boot`. It never writes a register, and it touches the
+- * DWC3 / PHY register blocks only when the GCC status registers say their
+- * power domain and clocks are on (an access to a gated block would hang).
++ * The Qualcomm bring-up this replaces (GCC clock gates, QUSB2 PHY, QSCRATCH
++ * VBUS override) has no Exynos850 equivalent. What is needed instead:
++ *   - clocks: CMU_HSI USB gates (USB_BUS_EARLY_CLK, USB_REF_CLK, USB_PHY_ACLK,
++ *     USB_PHY_REF_CLK) - the bootloader may or may not have left them on;
++ *   - the Samsung USBDRD UTMI PHY at 0x135d0000 (phy-exynos850-usbdrd) and
++ *     its PMU isolation bit in the PMU block at 0x11860000;
++ *   - DWC3 at 0x13600000 (size 0x10000), high-speed only (maximum-speed =
++ *     "high-speed"), single UTMI PHY, no QSCRATCH.
++ * The DWC3 device-mode gadget logic (EP0, ECM, UDP log stream) of the original
++ * driver is generic Synopsys DWC3 and can be reused once the PHY is up; the
++ * Qualcomm version is kept in docs/reference/qcom-sweet/a135f_usb.c.ref.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+-#include <kern/clock.h>
+-#include <kern/thread.h>
+-#include <kern/sched_prim.h>
+-#include <machine/machine_routines.h>
+-#include <arm/caches_internal.h>
+-#include <vm/pmap.h>
+-#include <vm/vm_kern.h>
+-#include <pexpert/pexpert.h>
+-#include <kern/locks.h>
+-#include <sys/kpi_mbuf.h>
+-#include <sys/kpi_socket.h>
+-#include <sys/sockio.h>
+-#include <net/if.h>
+-#include <net/if_types.h>
+-#include <net/ethernet.h>
+-#include <net/if_ether.h>
+-#include <net/ether_if_module.h>
+-#include <net/kpi_interface.h>
+-#include <net/kpi_protocol.h>
+-#include <netinet/in.h>
+-#include <net/if_media.h>
+-#include <net/dlil.h>
+-#include <sys/kern_event.h>
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void a135f_usb_probe(void);
+-static void a135f_usb_gadget_start(vm_offset_t dwc);
+-extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+-
+-#define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+-#define CBCR_CLK_OFF            (1u << 31)
+-
+-static const struct {
+-	const char *name;
+-	uint32_t    off;
+-} usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
+-};
+-
+-#define DWC3_PA                 0x0a600000
+-#define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
+-
+-static uint32_t
+-usb_rd(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile ("dmb oshld" ::: "memory");
+-	return v;
+-}
+ 
+ void
+ a135f_usb_probe(void)
+ {
+-	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+-	bool clocks_on = true;
+-
+-	/* a135f_usb=0 off, 1 (default) report state only, 2 also start the USB device */
+-	PE_parse_boot_argn("a135f_usb", &enabled, sizeof(enabled));
+-	if (!enabled) {
+-		return;
+-	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+-	if (gcc == 0) {
+-		printf("A135F USB: GCC map failed\n");
+-		return;
+-	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+-	printf("A135F USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("A135F USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+-		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+-	}
+-	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+-	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+-	if (!clocks_on) {
+-		printf("A135F USB: controller unpowered or unclocked; DWC3 not read\n");
+-		return;
+-	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+-	if (dwc == 0) {
+-		printf("A135F USB: DWC3 map failed\n");
+-		return;
+-	}
+-	printf("A135F USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+-	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+-	printf("A135F USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+-	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
+-	    usb_rd(dwc, 0xc720));
+-	printf("A135F USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+-	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+-	    usb_rd(dwc, 0xc140));
+-	if (enabled >= 2) {
+-		a135f_usb_gadget_start(dwc);
+-	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("A135F USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("A135F USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+-}
+-
+-/*
+- * Step 2: USB device mode with only the default control endpoint, enough
+- * for the host to enumerate the phone (boot-arg a135f_usb=2). ABL leaves
+- * the DWC3 powered, clocked, in device mode and halted, with the PHY set
+- * up, so only the device controller is restarted: soft reset, an event
+- * buffer in our memory, endpoint 0, run. Events are polled from a kernel
+- * thread (no interrupt), like the UFS driver. DMA is not cache coherent
+- * (DT qcom,gsi-disable-io-coherency): buffers are cleaned/invalidated.
+- * Register layout and the control-transfer state machine follow the
+- * Synopsys DWC3 databook as used by Linux drivers/usb/dwc3 (gadget.c,
+- * ep0.c).
+- */
+-#define GCTL            0xc110
+-#define GEVNTADRLO      0xc400
+-#define GEVNTADRHI      0xc404
+-#define GEVNTSIZ        0xc408
+-#define GEVNTCOUNT      0xc40c
+-#define DCFG            0xc700
+-#define DCTL            0xc704
+-#define DEVTEN          0xc708
+-#define DSTS            0xc70c
+-#define DALEPENA        0xc720
+-#define DEPCMDPAR2(n)   (0xc800 + 0x10 * (n))
+-#define DEPCMDPAR1(n)   (0xc804 + 0x10 * (n))
+-#define DEPCMDPAR0(n)   (0xc808 + 0x10 * (n))
+-#define DEPCMD(n)       (0xc80c + 0x10 * (n))
+-
+-/*
+- * Qualcomm wrapper registers ("QSCRATCH", core base + 0xf8800). The
+- * controller only connects (pull-up on D+) while it sees a valid VBUS
+- * session; Linux dwc3-qcom forces that in software when the charger
+- * reports a cable (dwc3_qcom_vbus_override_enable).
+- */
+-#define QSCRATCH_PA             0x0a6f8800
+-#define QSCRATCH_HS_PHY_CTRL    0x10
+-#define   UTMI_OTG_VBUS_VALID   (1u << 20)
+-#define   SW_SESSVLD_SEL        (1u << 28)
+-#define QSCRATCH_SS_PHY_CTRL    0x30
+-#define   LANE0_PWR_PRESENT     (1u << 24)
+-
+-#define DCTL_RUN_STOP   (1u << 31)
+-#define DCTL_CSFTRST    (1u << 30)
+-#define DSTS_DEVCTRLHLT (1u << 22)
+-
+-#define DEPCMD_SETEPCONFIG      1
+-#define DEPCMD_SETTRANSFRESOURCE 2
+-#define DEPCMD_SETSTALL         4
+-#define DEPCMD_STARTTRANSFER    6
+-#define DEPCMD_DEPSTARTCFG      9
+-#define DEPCMD_CMDACT           (1u << 10)
+-
+-#define TRB_HWO         (1u << 0)
+-#define TRB_LST         (1u << 1)
+-#define TRB_ISP_IMI     (1u << 10)
+-#define TRB_IOC         (1u << 11)
+-#define TRBCTL_SETUP    (2u << 4)
+-#define TRBCTL_STATUS2  (3u << 4)
+-#define TRBCTL_STATUS3  (4u << 4)
+-#define TRBCTL_DATA     (5u << 4)
+-
+-/* DMA area layout */
+-#define UD_EVT          0x0000          /* event buffer, 4 KiB */
+-#define UD_EVT_SIZE     0x1000
+-#define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
+-#define UD_TRB_IN       0x1010          /* ep0 IN TRB */
+-#define UD_TRB_RX       0x1020          /* ep1 OUT (bulk, host -> phone) */
+-#define UD_TRB_TX       0x1030          /* ep1 IN (bulk, phone -> host) */
+-#define UD_TRB_INT      0x1050          /* ep2 IN (interrupt, notifications) */
+-#define UD_SETUP        0x1040          /* 8-byte setup packet */
+-#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
+-#define UD_NOTIFY       0x1300          /* 16-byte notification */
+-#define UD_RX           0x2000          /* one received frame */
+-#define UD_TX           0x2800          /* one frame to send */
+-#define UD_FRAME_MAX    0x800
+-#define UD_SIZE         0x4000
+-
+-/* Physical endpoints: 2n = OUT, 2n+1 = IN */
+-#define EP_RX           2               /* 0x01 bulk OUT */
+-#define EP_TX           3               /* 0x81 bulk IN */
+-#define EP_INT          5               /* 0x82 interrupt IN */
+-#define TRBCTL_NORMAL   (1u << 4)
+-
+-#define UD_TXQ          32
+-
+-static struct {
+-	vm_offset_t dwc;
+-	vm_offset_t dma;
+-	uint64_t    dma_pa;
+-	uint32_t    evt_pos;
+-	int         sleep_chan;
+-	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
+-	bool        data_in;        /* data stage direction */
+-	uint32_t    events;
+-	bool        configured;
+-	uint8_t     data_alt;       /* data interface alternate setting */
+-	/* network */
+-	ifnet_t     ifp;
+-	lck_mtx_t  *lock;           /* TX ring and TX endpoint */
+-	mbuf_t      txq[UD_TXQ];
+-	unsigned    txq_head, txq_count;
+-	bool        tx_busy;
+-	uint64_t    rx_frames, tx_frames;
+-} ud;
+-
+-static inline void
+-dwc_wr(uint32_t off, uint32_t v)
+-{
+-	*(volatile uint32_t *)(ud.dwc + off) = v;
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-}
+-
+-static inline uint32_t
+-dwc_rd(uint32_t off)
+-{
+-	return usb_rd(ud.dwc, off);
+-}
+-
+-static void
+-ud_sync(uint32_t off, uint32_t len)
+-{
+-	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
+-}
+-
+-static void
+-ud_sleep_ms(unsigned ms)
+-{
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
+-	thread_block(THREAD_CONTINUE_NULL);
+-}
+-
+-static int
+-ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+-{
+-	dwc_wr(DEPCMDPAR0(ep), p0);
+-	dwc_wr(DEPCMDPAR1(ep), p1);
+-	dwc_wr(DEPCMDPAR2(ep), p2);
+-	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
+-		uint32_t v = dwc_rd(DEPCMD(ep));
+-		if (!(v & DEPCMD_CMDACT)) {
+-			uint32_t status = (v >> 12) & 0xf;
+-			if (status) {
+-				printf("A135F USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+-				return -1;
+-			}
+-			return 0;
+-		}
+-		delay(1);
+-	}
+-	printf("A135F USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
+-	return -1;
+-}
+-
+-/* One TRB (at DMA offset trb) on physical endpoint ep. */
+-static void
+-ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+-{
+-	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
+-	uint64_t bpa = ud.dma_pa + buf;
+-
+-	t[0] = (uint32_t)bpa;
+-	t[1] = (uint32_t)(bpa >> 32);
+-	t[2] = len;
+-	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
+-	ud_sync(trb, 16);
+-	if (len) {
+-		ud_sync(buf, len);
+-	}
+-	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
+-}
+-
+-static void
+-ud_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
+-{
+-	ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
+-}
+-
+-static void
+-ud_start_setup(void)
+-{
+-	ud.state = EP0_SETUP;
+-	ud_start(0, UD_SETUP, 8, TRBCTL_SETUP);
+-}
+-
+-static void
+-ud_stall(void)
+-{
+-	ud_epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
+-	ud_start_setup();
+-}
+-
+-/*
+- * USB descriptors: a CDC-ECM (Ethernet) function, which Linux (cdc_ether)
+- * and macOS drive without extra drivers. VID 0x1209 / PID 0x0001 =
+- * pid.codes test ID, not a product.
+- */
+-static const uint8_t ud_dev_desc[18] = {
+-	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
+-	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+-};
+-static const uint8_t ud_cfg_desc[80] = {
+-	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
+-	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
+-	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
+-	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
+-	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
+-	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) uframes */
+-	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
+-	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
+-	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+-	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+-};
+-/* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+-static const char *const ud_strings[] = {
+-	NULL, "ios-a135f", "A135F iOS (USB Ethernet)", "0001", "02005E77EE01",
+-};
+-static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
+-
+-static uint32_t
+-ud_string(unsigned idx, uint8_t *out)
+-{
+-	if (idx == 0) {
+-		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
+-		return 4;
+-	}
+-	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
+-		return 0;
+-	}
+-	const char *str = ud_strings[idx];
+-	uint32_t n = 2;
+-	for (; *str && n < 126; str++) {
+-		out[n++] = (uint8_t)*str;
+-		out[n++] = 0;
+-	}
+-	out[0] = (uint8_t)n;
+-	out[1] = 3;
+-	return n;
+-}
+-
+-static void ud_rx_arm(void);
+-static void ud_tx_kick_locked(void);
+-static void ud_link_event(bool up);
+-
+-/* NETWORK_CONNECTION notification: the host brings its link up on it. */
+-static void
+-ud_notify_connected(void)
+-{
+-	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
+-	n[0] = 0xa1; n[1] = 0x00;       /* NETWORK_CONNECTION */
+-	n[2] = 1; n[3] = 0;             /* connected */
+-	n[4] = 0; n[5] = 0;             /* interface 0 */
+-	n[6] = 0; n[7] = 0;
+-	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
+-}
+-
+-/* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
+-static void
+-ud_configure(void)
+-{
+-	if (ud.configured) {
+-		return;
+-	}
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+-	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+-	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
+-	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
+-	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
+-	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("A135F USB: data endpoints setup failed\n");
+-		return;
+-	}
+-	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+-	ud.configured = true;
+-	ud_rx_arm();
+-	printf("A135F USB: ECM endpoints configured\n");
+-}
+-
+-static void
+-ud_setup(void)
+-{
+-	const uint8_t *st = (const uint8_t *)(ud.dma + UD_SETUP);
+-	uint8_t *data = (uint8_t *)(ud.dma + UD_DATA);
+-	uint8_t type = st[0], req = st[1];
+-	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
+-	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
+-	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
+-	uint32_t n = 0;
+-	bool ok = true;
+-
+-	printf("A135F USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+-	ud.data_in = (type & 0x80) != 0;
+-	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
+-	} else if ((type & 0x60) != 0) {
+-		ok = false;
+-	} else if (req == 6) {          /* GET_DESCRIPTOR */
+-		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
+-		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+-		default: ok = false; break;
+-		}
+-	} else if (req == 5) {          /* SET_ADDRESS: takes effect now (DWC3 handles the timing) */
+-		uint32_t dcfg = dwc_rd(DCFG) & ~(0x7fu << 3);
+-		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
+-		printf("A135F USB: address %u\n", value & 0x7f);
+-	} else if (req == 9) {          /* SET_CONFIGURATION */
+-		if (value == 1) {
+-			ud_configure();
+-		}
+-		printf("A135F USB: configured (%u)\n", value);
+-	} else if (req == 8) {          /* GET_CONFIGURATION */
+-		data[0] = ud.configured ? 1 : 0; n = 1;
+-	} else if (req == 0) {          /* GET_STATUS */
+-		data[0] = 0; data[1] = 0; n = 2;
+-	} else if (req == 11) {         /* SET_INTERFACE */
+-		if (index == 1) {
+-			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
+-				ud_notify_connected();
+-				ud_link_event(true);
+-			}
+-		}
+-	} else if (req == 10) {         /* GET_INTERFACE */
+-		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
+-	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
+-	} else {
+-		ok = false;
+-	}
+-	if (!ok) {
+-		ud_stall();
+-		return;
+-	}
+-	if (length == 0) {
+-		ud.state = EP0_WAIT_STATUS2;    /* status stage on XferNotReady */
+-		return;
+-	}
+-	ud.state = EP0_DATA;
+-	if (ud.data_in) {
+-		if (n > length) {
+-			n = length;
+-		}
+-		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+-	} else {
+-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
+-	}
+-}
+-
+-/* ---- network interface (ue0) ---- */
+-
+-static void
+-ud_rx_arm(void)
+-{
+-	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+-}
+-
+-static void
+-ud_rx_done(void)
+-{
+-	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+-	ud_sync(UD_TRB_RX, 16);
+-	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+-	ud_sync(UD_RX, UD_FRAME_MAX);
+-	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+-		/*
+-		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+-		 * may return a first mbuf of length 0: stripping the header from
+-		 * it panicked "Failed mbuf validity check: len -14".)
+-		 */
+-		mbuf_t m = NULL;
+-		if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+-		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+-		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+-			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
+-			mbuf_setlen(m, len);
+-			mbuf_pkthdr_setlen(m, len);
+-			void *frame_header = mbuf_data(m);
+-			mbuf_pkthdr_setrcvif(m, ud.ifp);
+-			mbuf_pkthdr_setheader(m, frame_header);
+-			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+-			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
+-			stats.packets_in = 1;
+-			stats.bytes_in = len;
+-			ud.rx_frames++;
+-			ifnet_input(ud.ifp, m, &stats);
+-		} else if (m != NULL) {
+-			mbuf_freem(m);
+-		}
+-	}
+-	ud_rx_arm();
+-}
+-
+-/* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
+-static void
+-ud_tx_kick_locked(void)
+-{
+-	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
+-		mbuf_t m = ud.txq[ud.txq_head];
+-		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+-		ud.txq_count--;
+-		size_t len = mbuf_pkthdr_len(m);
+-		if (len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
+-			mbuf_freem(m);
+-			continue;
+-		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
+-		mbuf_freem(m);
+-		/* A frame of a multiple of 512 bytes would need a zero-length
+-		 * packet to end it; one pad byte does the same (IP ignores it). */
+-		if ((len % 512) == 0) {
+-			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
+-		}
+-		ud.tx_busy = true;
+-		ud.tx_frames++;
+-		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
+-	}
+-}
+-
+-static errno_t
+-ud_if_output(ifnet_t ifp, mbuf_t m)
+-{
+-	lck_mtx_lock(ud.lock);
+-	if (ud.txq_count == UD_TXQ || !ud.configured) {
+-		lck_mtx_unlock(ud.lock);
+-		mbuf_freem(m);
+-		ifnet_stat_increment_out(ifp, 0, 0, 1);
+-		return 0;
+-	}
+-	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
+-	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
+-	ud.txq_count++;
+-	ud_tx_kick_locked();
+-	lck_mtx_unlock(ud.lock);
+-	return 0;
+-}
+-
+-/*
+- * Link state for configd (KernelEventMonitor reads SIOCGIFMEDIA and the
+- * KEV_DL_LINK_ON/OFF events; IPMonitor does not route through a service
+- * whose interface has no active link).
+- */
+-static void
+-ud_link_event(bool up)
+-{
+-	if (ud.ifp != NULL) {
+-		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+-	}
+-}
+-
+-static errno_t
+-ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+-{
+-	switch (cmd) {
+-	case SIOCGIFMEDIA32:
+-	case SIOCGIFMEDIA64: {
+-		struct ifmediareq *ifmr = (struct ifmediareq *)data;
+-		user_addr_t list = (cmd == SIOCGIFMEDIA64) ?
+-		    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
+-		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
+-		int media = IFM_ETHER | IFM_AUTO;
+-		ifmr->ifm_current = media;
+-		ifmr->ifm_active = ud.configured ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
+-		ifmr->ifm_mask = 0;
+-		ifmr->ifm_status = IFM_AVALID | (ud.configured ? IFM_ACTIVE : 0);
+-		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
+-			ifmr->ifm_count = 1;
+-			return copyout(&media, list, sizeof(media));
+-		}
+-		ifmr->ifm_count = 1;
+-		return 0;
+-	}
+-	case SIOCSIFADDR:
+-	case SIOCAIFADDR:
+-		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
+-		return 0;
+-	case SIOCSIFFLAGS:
+-	case SIOCADDMULTI:
+-	case SIOCDELMULTI:
+-		return 0;
+-	default:
+-		return EOPNOTSUPP;
+-	}
+-}
+-
+-static void
+-ud_if_detach(ifnet_t ifp __unused)
+-{
+-}
+-
+-/* ue0, 192.168.7.2/24 (the host side is 192.168.7.1). */
+-static void
+-ud_if_create(void)
+-{
+-	struct ifnet_init_eparams init;
+-	static lck_grp_t *grp;
+-
+-	grp = lck_grp_alloc_init("a135f_usb", LCK_GRP_ATTR_NULL);
+-	ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
+-
+-	bzero(&init, sizeof(init));
+-	init.ver = IFNET_INIT_CURRENT_VERSION;
+-	init.len = sizeof(init);
+-	init.flags = IFNET_INIT_LEGACY;
+-	init.uniqueid = "a135f-usb-ecm";
+-	init.uniqueid_len = sizeof("a135f-usb-ecm") - 1;
+-	init.name = "ue";
+-	init.unit = 0;
+-	init.family = IFNET_FAMILY_ETHERNET;
+-	init.type = IFT_ETHER;
+-	init.output = ud_if_output;
+-	init.demux = ether_demux;
+-	init.add_proto = ether_add_proto;
+-	init.del_proto = ether_del_proto;
+-	init.check_multi = ether_check_multi;
+-	init.framer_extended = ether_frameout_extended;
+-	init.ioctl = ud_if_ioctl;
+-	init.detach = ud_if_detach;
+-	init.broadcast_addr = etherbroadcastaddr;
+-	init.broadcast_len = ETHER_ADDR_LEN;
+-	if (ifnet_allocate_extended(&init, &ud.ifp) != 0) {
+-		printf("A135F USB: ifnet_allocate failed\n");
+-		ud.ifp = NULL;
+-		return;
+-	}
+-	ifnet_set_addrlen(ud.ifp, ETHER_ADDR_LEN);
+-	ifnet_set_hdrlen(ud.ifp, sizeof(struct ether_header));
+-	ifnet_set_mtu(ud.ifp, ETHERMTU);
+-	ifnet_set_baudrate(ud.ifp, 480000000);
+-	ifnet_set_flags(ud.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
+-	if (ifnet_attach(ud.ifp, NULL) != 0) {
+-		printf("A135F USB: ifnet_attach failed\n");
+-		ud.ifp = NULL;
+-		return;
+-	}
+-	ifnet_set_lladdr(ud.ifp, ud_phone_mac, ETHER_ADDR_LEN);
+-
+-	errno_t err = proto_plumb(PF_INET, ud.ifp);
+-	socket_t so = NULL;
+-	if (err == 0) {
+-		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
+-	}
+-	if (err == 0) {
+-		struct ifaliasreq ifra;
+-		bzero(&ifra, sizeof(ifra));
+-		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
+-		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
+-		a->sin_len = sizeof(*a);
+-		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
+-		a = (struct sockaddr_in *)&ifra.ifra_mask;
+-		a->sin_len = sizeof(*a);
+-		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xffffff00);
+-		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+-		a->sin_len = sizeof(*a);
+-		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a807ff);
+-		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+-		sock_close(so);
+-	}
+-	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-	printf("A135F USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+-}
+-
+-static void
+-ud_event(uint32_t ev)
+-{
+-	if (ev & 1) {                   /* device event */
+-		uint32_t type = (ev >> 8) & 0xf;
+-		if (type == 1) {        /* USB reset */
+-			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("A135F USB: bus reset\n");
+-		} else if (type == 2) { /* connect done */
+-			uint32_t speed = dwc_rd(DSTS) & 7;
+-			/* ep0 max packet: 64 at high/full speed (modify action) */
+-			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
+-			    (1u << 8) | (1u << 10) | (0u << 25), 0);
+-			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
+-			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+-			printf("A135F USB: connected, speed %u\n", speed);
+-		} else if (type == 0) {
+-			printf("A135F USB: disconnect\n");
+-		}
+-		return;
+-	}
+-	unsigned ep = (ev >> 1) & 0x1f;
+-	unsigned type = (ev >> 6) & 0xf;
+-	unsigned status = (ev >> 12) & 0xf;
+-
+-	if (ep == EP_RX && type == 1) {
+-		ud_rx_done();
+-		return;
+-	}
+-	if (ep == EP_TX && type == 1) {
+-		lck_mtx_lock(ud.lock);
+-		ud.tx_busy = false;
+-		ud_tx_kick_locked();
+-		lck_mtx_unlock(ud.lock);
+-		return;
+-	}
+-	if (ep > 1) {
+-		return;
+-	}
+-	/*
+-	 * Control transfer state machine (Linux dwc3 ep0.c): SETUP completes ->
+-	 * request handled; the data stage (if any) is started right away; the
+-	 * status stage is started when the controller reports XferNotReady
+-	 * with status "control status"; its completion re-arms SETUP.
+-	 */
+-	if (type == 1) {                /* XferComplete */
+-		switch (ud.state) {
+-		case EP0_SETUP:
+-			ud_sync(UD_SETUP, 8);
+-			ud_setup();
+-			break;
+-		case EP0_DATA:
+-			ud.state = EP0_WAIT_STATUS3;
+-			break;
+-		case EP0_STATUS:
+-			ud_start_setup();
+-			break;
+-		default:
+-			break;
+-		}
+-		return;
+-	}
+-	if (type == 3 && status == 2) { /* XferNotReady, control status phase */
+-		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
+-			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
+-			ud.state = EP0_STATUS;
+-			ud_start(ep, UD_DATA, 0, ctl);
+-		}
+-	}
+-}
+-
+-static void
+-ud_thread(void *arg __unused, wait_result_t wr __unused)
+-{
+-	uint32_t ticks = 0;
+-	for (;;) {
+-		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+-		if (count) {
+-			ud_sync(UD_EVT, UD_EVT_SIZE);
+-			for (uint32_t done = 0; done < count; done += 4) {
+-				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+-				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-				if (ud.events++ < 200) {
+-					printf("A135F USB: event 0x%08x\n", ev);
+-				}
+-				ud_event(ev);
+-			}
+-			dwc_wr(GEVNTCOUNT, count);
+-		}
+-		if ((++ticks % 30000) == 0) {
+-			printf("A135F USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+-		}
+-		ud_sleep_ms(1);
+-	}
+-}
+-
+-/*
+- * Live console log over USB Ethernet: every 100 ms the new bytes of the
+- * console ring (bsd/dev/a135f_ufs.c) go as UDP datagrams to
+- * 192.168.7.1:5140 (on the PC: nc -ukl 5140). Starts with the last 64 KiB
+- * so the boot is included. Nothing here may print (it would feed itself).
+- * Boot-arg a135f_usblog=0 disables it.
+- */
+-extern uint32_t a135f_log_copy(uint64_t *pos, char *out, uint32_t max);
+-extern uint64_t a135f_log_position(void);
+-
+-static void
+-ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+-{
+-	static char chunk[1400];
+-	socket_t so = NULL;
+-	struct sockaddr_in to;
+-	uint64_t pos = a135f_log_position();
+-
+-	pos = pos > 65536 ? pos - 65536 : 0;
+-	bzero(&to, sizeof(to));
+-	to.sin_len = sizeof(to);
+-	to.sin_family = AF_INET;
+-	to.sin_port = htons(5140);
+-	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+-	for (;;) {
+-		ud_sleep_ms(100);
+-		if (!ud.configured) {
+-			continue;
+-		}
+-		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+-			so = NULL;
+-			continue;
+-		}
+-		uint32_t n;
+-		while ((n = a135f_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+-			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+-			struct msghdr msg = {
+-				.msg_name = &to, .msg_namelen = sizeof(to),
+-				.msg_iov = &iov, .msg_iovlen = 1,
+-			};
+-			size_t sent = 0;
+-			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
+-			}
+-		}
+-	}
+-}
+-
+-static void
+-a135f_usb_gadget_start(vm_offset_t dwc)
+-{
+-	thread_t thread;
+-
+-	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("A135F USB: no DMA memory\n");
+-		return;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+-	if (!pn) {
+-		return;
+-	}
+-	ud.dma_pa = ptoa_64(pn);
+-	ud_if_create();
+-
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	printf("A135F USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+-		return;
+-	}
+-
+-	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+-	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+-	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+-	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+-	ud.evt_pos = 0;
+-
+-	/* High speed, address 0 */
+-	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+-	dwc_wr(DCFG, dcfg | 0);
+-	/* Events: disconnect, USB reset, connect done */
+-	dwc_wr(DEVTEN, 0x7);
+-
+-	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+-	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+-	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("A135F USB: endpoint 0 setup failed\n");
+-		return;
+-	}
+-	dwc_wr(DALEPENA, 0x3);
+-	ud_start_setup();
+-
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	if (qs != 0) {
+-		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+-		printf("A135F USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+-		    hs, ss, usb_rd(qs, 0x08));
+-		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
+-		*(volatile uint32_t *)(qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("A135F USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
+-		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+-	}
+-
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+-	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+-		delay(1000);
+-	}
+-	printf("A135F USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+-	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	}
+-	int livelog = 1;
+-	PE_parse_boot_argn("a135f_usblog", &livelog, sizeof(livelog));
+-	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	}
++	printf("A135F USB: Exynos850 USBDRD PHY bring-up not implemented; USB disabled\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/iokit/Kernel/arm/A135FBattery.cpp b/iokit/Kernel/arm/A135FBattery.cpp
+index 1832da0..032d51e 100644
+--- a/iokit/Kernel/arm/A135FBattery.cpp
++++ b/iokit/Kernel/arm/A135FBattery.cpp
+@@ -12,9 +12,14 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+-/* bsd/dev/a135f_spmi.c */
+-extern "C" int a135f_spmi_init(void);
+-extern "C" int a135f_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/*
++ * The Galaxy A13's battery sits behind a MAX1726x fuel gauge on I2C and the
++ * S2MPU12 PMIC; neither has a driver here yet. The Qualcomm SPMI readout this
++ * file used is gone: these stubs always fail, so the service publishes the
++ * static 100 % / charging fallback.
++ */
++static inline int a135f_spmi_init(void) { return -1; }
++static inline int a135f_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
+ 
+ class A135FBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(A135FBattery);

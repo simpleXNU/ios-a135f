@@ -1,0 +1,1822 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d43bc59..ce36307 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -104,12 +104,10 @@ bsd/dev/dtrace/fasttrap.c		optional config_dtrace
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+-bsd/dev/a135f_ufs.c			standard
++bsd/dev/a135f_mmc.c			standard
+ bsd/dev/a135f_sample.c			standard
+ bsd/dev/a135f_keys.c			standard
+ bsd/dev/a135f_touch.c			standard
+-bsd/dev/a135f_rpmh.c			standard
+-bsd/dev/a135f_spmi.c			standard
+ bsd/dev/a135f_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/a135f_mmc.c b/bsd/dev/a135f_mmc.c
+new file mode 100644
+index 0000000..5a33ef5
+--- /dev/null
++++ b/bsd/dev/a135f_mmc.c
+@@ -0,0 +1,944 @@
++/*
++ * Galaxy A13 (Exynos850) internal eMMC root device.
++ *
++ * The eMMC sits behind a Synopsys DesignWare Mobile Storage Host (DW-MSHC,
++ * Samsung "exynos7-dw-mshc" flavour) at 0x12100000. The bootloader that
++ * loaded our boot image from it leaves the controller enabled, the card
++ * selected and the bus (HS200/HS400) trained. This driver reuses that state
++ * and never touches clocks, pad timing or the card's bus mode: it only issues
++ * polled CMD17/18/24/25 through the internal DMA controller (IDMAC) and
++ * restores the card's main user partition if the bootloader left a boot or
++ * RPMB partition selected. It finds one GPT partition by name (boot-arg
++ * mmcroot=, default "userdata") and exposes it as the BSD disk mmcroot0
++ * (rmmcroot0), with 512-byte logical sectors over 4 KiB device blocks.
++ * Root on it with rd=mmcroot0.
++ *
++ * DMA: the IDMAC is only guaranteed to address 32 bits and XNU's RAM sits at
++ * 0x880000000, so descriptors and a 1 MiB bounce buffer live in a small
++ * physical window below 4 GiB that XNU does not manage (ADT node /a135f-mmc,
++ * property dma-base, default 0xc8000000). It is mapped as device memory,
++ * hence cache-coherent by construction, and accessed with aligned 64-bit
++ * loads and stores only.
++ *
++ * Writes are refused unless boot-arg mmcrw=1 is set. Every write is checked
++ * against the partition bounds again right before it is issued, so nothing
++ * outside the named partition can be written.
++ */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* osfmk/arm/cpu_data.h, not exported to the BSD layer */
++extern int get_preemption_level(void);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++static void a135f_log_start(void);
++extern void a135f_sample_start(void);
++extern void a135f_keys_init(void);
++extern void a135f_touch_init(void);
++extern void a135f_usb_probe(void);
++
++/* DW-MSHC registers (drivers/mmc/host/dw_mmc.h) */
++#define SDMMC_CTRL      0x000
++#define SDMMC_CLKENA    0x010
++#define SDMMC_BLKSIZ    0x01c
++#define SDMMC_BYTCNT    0x020
++#define SDMMC_INTMASK   0x024
++#define SDMMC_CMDARG    0x028
++#define SDMMC_CMD       0x02c
++#define SDMMC_RESP0     0x030
++#define SDMMC_RINTSTS   0x044
++#define SDMMC_STATUS    0x048
++#define SDMMC_VERID     0x06c
++#define SDMMC_HCON      0x070
++#define SDMMC_BMOD      0x080
++#define SDMMC_PLDMND    0x084
++#define SDMMC_DBADDR    0x088   /* 32-bit IDMAC: DBADDR, IDSTS 0x08c; 64-bit: DBADDRL/U 0x88/0x8c, IDSTS64 0x090 */
++#define SDMMC_DBADDRU   0x08c
++#define SDMMC_IDSTS     0x08c
++#define SDMMC_IDSTS64   0x090
++
++#define CTRL_RESET      (1u << 0)
++#define CTRL_FIFO_RESET (1u << 1)
++#define CTRL_DMA_RESET  (1u << 2)
++#define CTRL_DMA_EN     (1u << 5)
++#define CTRL_USE_IDMAC  (1u << 25)
++
++#define INT_RESP_ERR    (1u << 1)
++#define INT_CMD_DONE    (1u << 2)
++#define INT_DATA_OVER   (1u << 3)
++#define INT_RCRC        (1u << 6)
++#define INT_DCRC        (1u << 7)
++#define INT_RTO         (1u << 8)
++#define INT_DRTO        (1u << 9)
++#define INT_HLE         (1u << 12)
++#define INT_SBE         (1u << 13)
++#define INT_EBE         (1u << 15)
++#define INT_ERRORS      (INT_RESP_ERR | INT_RCRC | INT_DCRC | INT_RTO | INT_DRTO | INT_HLE | INT_SBE | INT_EBE)
++
++#define CMD_START       (1u << 31)
++#define CMD_USE_HOLD    (1u << 29)
++#define CMD_PRV_DAT_WAIT (1u << 13)
++#define CMD_SEND_STOP   (1u << 12)
++#define CMD_DAT_WR      (1u << 10)
++#define CMD_DAT_EXP     (1u << 9)
++#define CMD_RESP_CRC    (1u << 8)
++#define CMD_RESP_EXP    (1u << 6)
++
++#define STATUS_BUSY     (1u << 9)       /* card data busy / programming */
++#define BMOD_SWRESET    (1u << 0)
++#define BMOD_FB         (1u << 1)
++#define BMOD_DE         (1u << 7)
++#define HCON_ADDR64(h)  (((h) >> 27) & 1u)
++
++/* 32-bit IDMAC descriptor flags (des0) */
++#define DES0_DIC        (1u << 1)
++#define DES0_LD         (1u << 2)
++#define DES0_FS         (1u << 3)
++#define DES0_CH         (1u << 4)
++#define DES0_OWN        (1u << 31)
++
++#define R1_ERROR_MASK   0xfdf98080u     /* card status error bits (CMD13 R1), ignoring ready-for-data etc. */
++
++#define DEV_BLOCK       4096u           /* device block as seen by the BSD layer */
++#define SECTOR          512u
++#define BOUNCE_SIZE     (1u << 20)
++#define DESC_CHUNK      4096u           /* IDMAC buffer-size field is 13 bits */
++#define DESC_MAX        (BOUNCE_SIZE / DESC_CHUNK)
++#define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
++#define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
++#define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
++
++#define DMA_DEFAULT_PA  0xc8000000ull
++#define DMA_DESC        0x0000          /* DESC_MAX * 32 bytes (worst case, 64-bit layout) = 8 KiB */
++#define DMA_BOUNCE      0x2000
++#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;                        /* kernel VA of the DMA window (device mapping) */
++	uint64_t dma_pa;
++	bool dma64;                             /* IDMAC uses the 64-bit descriptor format */
++	bool hold;                              /* CMD.USE_HOLD_REG (DW-MSHC >= 2.40a) */
++	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
++	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool writable;                          /* boot-arg mmcrw=1 */
++	bool wait;                              /* boot-arg mmcwait=1 */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} su;
++
++static LCK_GRP_DECLARE(a135f_mmc_grp, "a135f_mmc");
++static LCK_MTX_DECLARE(a135f_mmc_lock, &a135f_mmc_grp);
++
++static inline uint32_t
++mmc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.regs + off);
++}
++
++static inline void
++mmc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(su.regs + off) = v;
++}
++
++/* The DMA window is device memory: aligned 64-bit accesses only. */
++static void
++dma_put(uint32_t off, const void *from, uint32_t len)
++{
++	volatile uint64_t *d = (volatile uint64_t *)(su.dma + off);
++	const uint8_t *s = from;
++	for (uint32_t i = 0; i < len / 8; i++) {
++		uint64_t v;
++		memcpy(&v, s + 8 * i, 8);
++		d[i] = v;
++	}
++}
++
++static void
++dma_get(void *to, uint32_t off, uint32_t len)
++{
++	volatile const uint64_t *s = (volatile const uint64_t *)(su.dma + off);
++	uint8_t *d = to;
++	for (uint32_t i = 0; i < len / 8; i++) {
++		uint64_t v = s[i];
++		memcpy(d + 8 * i, &v, 8);
++	}
++}
++
++static void
++desc_wr(uint32_t idx, uint64_t buf, uint32_t size, bool first, bool last)
++{
++	uint32_t d0 = DES0_OWN | DES0_CH | (first ? DES0_FS : 0) | (last ? DES0_LD : 0) | (last ? 0 : DES0_DIC);
++	volatile uint32_t *d;
++	if (su.dma64) {
++		/* idmac_desc_64addr: des0, des1 (rsvd), des2 (size), des3, buf lo/hi, next lo/hi */
++		uint64_t next = su.dma_pa + DMA_DESC + (uint64_t)(idx + 1) * 32;
++		d = (volatile uint32_t *)(su.dma + DMA_DESC + idx * 32);
++		d[1] = 0; d[2] = size; d[3] = 0;
++		d[4] = (uint32_t)buf; d[5] = (uint32_t)(buf >> 32);
++		d[6] = (uint32_t)next; d[7] = (uint32_t)(next >> 32);
++		__builtin_arm_dsb(0xf);
++		d[0] = d0;
++	} else {
++		/* idmac_desc: des0, des1 (size), des2 (buf), des3 (next) */
++		uint32_t next = (uint32_t)(su.dma_pa + DMA_DESC + (uint64_t)(idx + 1) * 16);
++		d = (volatile uint32_t *)(su.dma + DMA_DESC + idx * 16);
++		d[1] = size; d[2] = (uint32_t)buf; d[3] = next;
++		__builtin_arm_dsb(0xf);
++		d[0] = d0;
++	}
++}
++
++/* Wait for (RINTSTS & mask) == mask or an error; sleeps if allowed. Returns 0 / errno. */
++static int
++mmc_wait_int(uint32_t mask, uint32_t *sts_out)
++{
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
++	    !ml_at_interrupt_context() && get_preemption_level() == 0;
++	uint64_t spin_until = 0, sleep_interval = 0;
++	if (sleepable) {
++		nanoseconds_to_absolutetime(CMD_SPIN_NS, &spin_until);
++		spin_until += mach_absolute_time();
++		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
++	}
++	for (;;) {
++		uint32_t sts = mmc_rd(SDMMC_RINTSTS);
++		*sts_out = sts;
++		if (sts & INT_ERRORS) {
++			return EIO;
++		}
++		if ((sts & mask) == mask) {
++			return 0;
++		}
++		uint64_t now = mach_absolute_time();
++		if (now > deadline) {
++			return ETIMEDOUT;
++		}
++		if (sleepable && now >= spin_until) {
++			uint64_t wake = now + MIN(sleep_interval, deadline - now);
++			if (assert_wait_deadline_with_leeway((event_t)&su.wait, THREAD_UNINT,
++			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
++				thread_block(THREAD_CONTINUE_NULL);
++			}
++		} else {
++			delay(1);
++		}
++	}
++}
++
++static int
++mmc_wait_idle(void)
++{
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (mmc_rd(SDMMC_STATUS) & STATUS_BUSY) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++static int
++mmc_start_cmd(uint32_t flags)
++{
++	mmc_wr(SDMMC_CMD, CMD_START | (su.hold ? CMD_USE_HOLD : 0) | flags);
++	for (int i = 0; i < 100000 && (mmc_rd(SDMMC_CMD) & CMD_START); i++) {
++		delay(1);
++	}
++	return (mmc_rd(SDMMC_CMD) & CMD_START) ? ETIMEDOUT : 0;
++}
++
++/* Command without data (R1 / R1b). */
++static int
++mmc_cmd(uint32_t index, uint32_t arg, uint32_t *resp0)
++{
++	uint32_t sts;
++	int error = mmc_wait_idle();
++	if (error) {
++		return error;
++	}
++	mmc_wr(SDMMC_RINTSTS, 0xffffffffu);
++	mmc_wr(SDMMC_CMDARG, arg);
++	if ((error = mmc_start_cmd(index | CMD_RESP_EXP | CMD_RESP_CRC | CMD_PRV_DAT_WAIT)) != 0 ||
++	    (error = mmc_wait_int(INT_CMD_DONE, &sts)) != 0) {
++		printf("A135F MMC: CMD%u failed (%d), rintsts 0x%x\n", index, error, mmc_rd(SDMMC_RINTSTS));
++		return error;
++	}
++	if (resp0) {
++		*resp0 = mmc_rd(SDMMC_RESP0);
++	}
++	return mmc_wait_idle();         /* R1b: DAT0 low while the card is busy */
++}
++
++/*
++ * One data command moving `sectors` 512-byte sectors between the card and
++ * the bounce buffer (write: bounce -> card). index is 8 (EXT_CSD), 17/18 or 24/25.
++ */
++static int
++mmc_xfer(uint32_t index, uint32_t arg, uint32_t sectors, bool write, bool stop)
++{
++	uint32_t len = sectors * SECTOR, sts, resp = 0;
++	int error;
++
++	assert(len <= BOUNCE_SIZE);
++	if ((error = mmc_wait_idle()) != 0) {
++		return error;
++	}
++	/* Fresh FIFO and IDMAC state for every command. */
++	mmc_wr(SDMMC_CTRL, mmc_rd(SDMMC_CTRL) | CTRL_FIFO_RESET | CTRL_DMA_RESET);
++	for (int i = 0; i < 100000 && (mmc_rd(SDMMC_CTRL) & (CTRL_FIFO_RESET | CTRL_DMA_RESET)); i++) {
++		delay(1);
++	}
++	mmc_wr(SDMMC_BMOD, mmc_rd(SDMMC_BMOD) | BMOD_SWRESET);
++
++	uint32_t n = 0, dsize = su.dma64 ? 32 : 16;
++	uint64_t buf = su.dma_pa + DMA_BOUNCE;
++	(void)dsize;
++	for (uint32_t done = 0; done < len; done += DESC_CHUNK, n++) {
++		uint32_t chunk = MIN(DESC_CHUNK, len - done);
++		desc_wr(n, buf + done, chunk, done == 0, done + chunk >= len);
++	}
++	__builtin_arm_dsb(0xf);
++
++	uint64_t list = su.dma_pa + DMA_DESC;
++	if (su.dma64) {
++		mmc_wr(SDMMC_DBADDR, (uint32_t)list);
++		mmc_wr(SDMMC_DBADDRU, (uint32_t)(list >> 32));
++	} else {
++		mmc_wr(SDMMC_DBADDR, (uint32_t)list);
++	}
++	mmc_wr(SDMMC_CTRL, mmc_rd(SDMMC_CTRL) | CTRL_USE_IDMAC | CTRL_DMA_EN);
++	mmc_wr(SDMMC_INTMASK, 0);
++	mmc_wr(SDMMC_RINTSTS, 0xffffffffu);
++	mmc_wr(SDMMC_BLKSIZ, SECTOR);
++	mmc_wr(SDMMC_BYTCNT, len);
++	mmc_wr(SDMMC_BMOD, BMOD_DE | BMOD_FB);
++	mmc_wr(SDMMC_PLDMND, 1);
++	mmc_wr(SDMMC_CMDARG, arg);
++	error = mmc_start_cmd(index | CMD_RESP_EXP | CMD_RESP_CRC | CMD_DAT_EXP | CMD_PRV_DAT_WAIT |
++	    (write ? CMD_DAT_WR : 0) | (stop ? CMD_SEND_STOP : 0));
++	if (!error) {
++		error = mmc_wait_int(INT_CMD_DONE | INT_DATA_OVER, &sts);
++	}
++	resp = mmc_rd(SDMMC_RESP0);
++	mmc_wr(SDMMC_BMOD, BMOD_FB);    /* IDMAC off */
++	if (error) {
++		printf("A135F MMC: CMD%u arg 0x%x x%u failed (%d), rintsts 0x%x\n",
++		    index, arg, sectors, error, mmc_rd(SDMMC_RINTSTS));
++		return error;
++	}
++	if (resp & R1_ERROR_MASK) {
++		printf("A135F MMC: CMD%u card status 0x%x\n", index, resp);
++		return EIO;
++	}
++	return write ? mmc_wait_idle() : 0;     /* writes: wait until the card finishes programming */
++}
++
++static int
++mmc_read_sectors(uint64_t sector, uint32_t count)
++{
++	if (sector > UINT32_MAX || count == 0 || count > BOUNCE_SIZE / SECTOR) {
++		return EINVAL;
++	}
++	return mmc_xfer(count == 1 ? 17 : 18, (uint32_t)sector, count, false, count != 1);
++}
++
++/* READ of count 4 KiB device blocks at block lba into the bounce buffer. */
++static int
++mmc_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (count > BOUNCE_SIZE / DEV_BLOCK) {
++		return EINVAL;
++	}
++	return mmc_read_sectors(lba * (DEV_BLOCK / SECTOR), count * (DEV_BLOCK / SECTOR));
++}
++
++/*
++ * WRITE of count device blocks from the bounce buffer to lba. The range
++ * must lie inside the partition: this is the only place data goes out.
++ */
++static int
++mmc_write_blocks(uint64_t lba, uint32_t count)
++{
++	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / DEV_BLOCK ||
++	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
++	    count > su.nblocks - (lba - su.first_block) ||
++	    (lba + count) * (DEV_BLOCK / SECTOR) > UINT32_MAX) {
++		printf("A135F MMC: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	uint32_t sectors = count * (DEV_BLOCK / SECTOR);
++	return mmc_xfer(sectors == 1 ? 24 : 25, (uint32_t)(lba * (DEV_BLOCK / SECTOR)), sectors, true, sectors != 1);
++}
++
++/* Best effort: CMD6 SWITCH EXT_CSD[32] (FLUSH_CACHE) = 1. Cards without a cache report a switch error; ignore it. */
++static int
++mmc_sync_cache(void)
++{
++	(void)mmc_cmd(6, (3u << 24) | (32u << 16) | (1u << 8) | 1u, NULL);
++	return 0;
++}
++
++/* GPT lives in 512-byte sectors on eMMC. */
++static int
++mmc_find_partition(const char *want)
++{
++	uint8_t hdr[SECTOR];
++	int error = mmc_read_sectors(1, 1);
++	if (error) {
++		return error;
++	}
++	dma_get(hdr, DMA_BOUNCE, SECTOR);
++	if (memcmp(hdr, "EFI PART", 8) != 0) {
++		printf("A135F MMC: no GPT\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, hdr + 72, 8);
++	memcpy(&nent, hdr + 80, 4);
++	memcpy(&esz, hdr + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		printf("A135F MMC: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	uint32_t esec = (nent * esz + SECTOR - 1) / SECTOR;
++	if ((error = mmc_read_sectors(entry_lba, esec)) != 0) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		uint8_t e[128];
++		dma_get(e, DMA_BOUNCE + i * esz, esz);
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (last < first || (first % (DEV_BLOCK / SECTOR)) != 0) {
++			printf("A135F MMC: partition \"%s\" (sectors %llu-%llu) not 4 KiB aligned\n", want, first, last);
++			return ENXIO;
++		}
++		su.first_block = first / (DEV_BLOCK / SECTOR);
++		su.nblocks = (last - first + 1) / (DEV_BLOCK / SECTOR);
++		return 0;
++	}
++	printf("A135F MMC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++/* Make sure the main user area is addressed (the bootloader may have left a boot partition selected). */
++static int
++mmc_select_user_area(void)
++{
++	uint8_t ext[SECTOR];
++	int error = mmc_xfer(8, 0, 1, false, false);    /* SEND_EXT_CSD */
++	if (error) {
++		return error;
++	}
++	dma_get(ext, DMA_BOUNCE, SECTOR);
++	uint8_t pc = ext[179];                          /* PARTITION_CONFIG */
++	printf("A135F MMC: EXT_CSD rev %u, partition config 0x%x\n", ext[192], pc);
++	if (pc & 7) {
++		return mmc_cmd(6, (3u << 24) | (179u << 16) | ((uint32_t)(pc & ~7u) << 8) | 1u, NULL);
++	}
++	return 0;
++}
++
++static int
++mmc_take_over_host(void)
++{
++	uint32_t hcon = mmc_rd(SDMMC_HCON), verid = mmc_rd(SDMMC_VERID) & 0xffff;
++	su.dma64 = HCON_ADDR64(hcon);
++	su.hold = verid >= 0x240a;
++	if (!(mmc_rd(SDMMC_CLKENA) & 1)) {
++		printf("A135F MMC: card clock is off (clkena 0x%x); the bootloader did not leave the bus running\n",
++		    mmc_rd(SDMMC_CLKENA));
++		return ENXIO;
++	}
++	if (su.dma_pa + DMA_SIZE - 1 >> 32) {
++		printf("A135F MMC: DMA window at 0x%llx is above 4 GiB\n", su.dma_pa);
++		return ENXIO;
++	}
++	printf("A135F MMC: DW-MSHC verid 0x%x hcon 0x%x (%s IDMAC), clkena 0x%x\n",
++	    verid, hcon, su.dma64 ? "64-bit" : "32-bit", mmc_rd(SDMMC_CLKENA));
++	if (mmc_wait_idle() != 0) {
++		printf("A135F MMC: controller busy at takeover (status 0x%x)\n", mmc_rd(SDMMC_STATUS));
++		return EBUSY;
++	}
++	return 0;
++}
++
++static int
++a135f_mmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!su.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !su.writable) ? EROFS : 0;
++}
++
++static int
++a135f_mmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++a135f_mmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = su.nblocks * DEV_BLOCK;
++
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !su.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&a135f_mmc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / DEV_BLOCK;
++		uint32_t skip = (uint32_t)(pos % DEV_BLOCK);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + DEV_BLOCK - 1) / DEV_BLOCK;
++		if ((skip | want) & 7) {
++			error = EINVAL;
++			break;
++		}
++		if (rd) {
++			error = mmc_read_blocks(su.first_block + lba, blocks);
++			if (!error) {
++				dma_get(vaddr + done, DMA_BOUNCE + skip, want);
++			}
++		} else {
++			/* Partial device blocks at either end: read, merge, write back. */
++			if (skip || (want % DEV_BLOCK)) {
++				error = mmc_read_blocks(su.first_block + lba, blocks);
++			}
++			if (!error) {
++				dma_put(DMA_BOUNCE + skip, vaddr + done, want);
++				error = mmc_write_blocks(su.first_block + lba, blocks);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&a135f_mmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++a135f_mmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = su.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > DEV_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		su.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = DEV_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = su.nblocks * DEV_BLOCK / su.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = su.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		if (!su.writable) {
++			return 0;
++		}
++		lck_mtx_lock(&a135f_mmc_lock);
++		int error = mmc_sync_cache();
++		lck_mtx_unlock(&a135f_mmc_lock);
++		return error;
++	}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / su.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++a135f_mmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return a135f_mmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++a135f_mmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return a135f_mmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++a135f_mmc_psize(__unused dev_t dev)
++{
++	return su.ready ? (int)MIN(su.nblocks * DEV_BLOCK / su.secsize, INT_MAX) : -1;
++}
++
++static int
++a135f_mmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(a135f_mmc_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++}
++
++static int
++a135f_mmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!su.writable) {
++		return EROFS;
++	}
++	return physio(a135f_mmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++}
++
++static const struct bdevsw a135f_mmc_bdevsw = {
++	.d_open     = a135f_mmc_open,
++	.d_close    = a135f_mmc_close,
++	.d_strategy = a135f_mmc_strategy,
++	.d_ioctl    = a135f_mmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = a135f_mmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw a135f_mmc_cdevsw = {
++	.d_open       = a135f_mmc_open,
++	.d_close      = a135f_mmc_close,
++	.d_read       = a135f_mmc_read,
++	.d_write      = a135f_mmc_write,
++	.d_ioctl      = a135f_mmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++a135f_mmc_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	uint64_t const *dma_prop = NULL;
++	unsigned int size = 0, dsize = 0;
++	char want[64] = "userdata";
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/a135f-mmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("A135F MMC: no /a135f-mmc node in the device tree\n");
++		return ENXIO;
++	}
++	su.dma_pa = DMA_DEFAULT_PA;
++	if (SecureDTGetProperty(node, "dma-base", (void const **)&dma_prop, &dsize) == kSuccess &&
++	    dsize >= sizeof(uint64_t)) {
++		su.dma_pa = dma_prop[0];
++	}
++	PE_parse_boot_argn("mmcroot", want, sizeof(want));
++	uint32_t rw = 0, wait = 0;
++	PE_parse_boot_argn("mmcrw", &rw, sizeof(rw));
++	PE_parse_boot_argn("mmcwait", &wait, sizeof(wait));
++	su.wait = (wait == 1);
++
++	su.regs = ml_io_map(reg[0], reg[1]);
++	su.dma = ml_io_map((vm_offset_t)su.dma_pa, DMA_SIZE);
++	if (!su.regs || !su.dma) {
++		printf("A135F MMC: cannot map registers or the DMA window\n");
++		return ENOMEM;
++	}
++	su.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&a135f_mmc_lock);
++	error = mmc_take_over_host();
++	if (!error) {
++		error = mmc_select_user_area();
++	}
++	if (!error) {
++		error = mmc_find_partition(want);
++	}
++	lck_mtx_unlock(&a135f_mmc_lock);
++	if (error) {
++		return error;
++	}
++
++	su.bmajor = bdevsw_add(-1, &a135f_mmc_bdevsw);
++	if (su.bmajor < 0) {
++		return ENXIO;
++	}
++	su.cmajor = cdevsw_add_with_bdev(-1, &a135f_mmc_cdevsw, su.bmajor);
++	if (su.cmajor < 0) {
++		return ENXIO;
++	}
++	su.bdev = makedev(su.bmajor, 0);
++	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "mmcroot0");
++	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rmmcroot0");
++	/* Only now, with the partition bounds known, can writes be allowed. */
++	su.writable = (rw != 0);
++	su.ready = true;
++	printf("A135F MMC: \"%s\": first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    want, su.first_block, su.nblocks * DEV_BLOCK >> 20,
++	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	a135f_log_start();
++	a135f_sample_start();
++	/* Input drivers (HID services in iokit/Kernel/arm/hid/A135FHID.cpp). */
++	a135f_keys_init();
++	a135f_touch_init();
++	a135f_usb_probe();
++	return 0;
++}
++
++/*
++ * Persistent console log ("a135f_log"). Filming the phone screen is the only
++ * other way to see the console, so every character that reaches the
++ * console (kernel printf and /dev/console writes of daemons, both through
++ * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
++ * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
++ * the partition every mmclogsecs seconds (default 10), far behind the HFS
++ * image at its start. Device block 0 of that area is a header:
++ *   "A135FLOG" | u32 version 1 | u32 ring size | u64 total bytes written
++ *   | u64 flush sequence
++ * ring offset of byte n = n % ring size. Read it from a recovery with
++ * tools/a135f-log-pull.sh. Disabled with boot-arg a135f_log=0.
++ */
++#define A135F_LOG_SIZE          (4u << 20)
++#define A135F_LOG_BLOCKS        (1 + A135F_LOG_SIZE / DEV_BLOCK)
++#define A135F_LOG_SECS          10u
++
++static char a135f_log_ring[A135F_LOG_SIZE];
++static uint64_t _Atomic a135f_log_total;
++static int a135f_log_chan;
++static uint32_t a135f_log_secs = A135F_LOG_SECS;
++
++/* Called for all console output, any context: never blocks. */
++void a135f_log_append(const char *c, int size);
++
++void
++a135f_log_append(const char *c, int size)
++{
++	if (size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&a135f_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		a135f_log_ring[(at + (uint64_t)i) % A135F_LOG_SIZE] = c[i];
++	}
++}
++
++/*
++ * Copy console bytes [*pos, total) (at most max) for live log streaming
++ * (a135f_usb.c). A reader that fell more than the ring behind skips ahead.
++ * Returns the byte count; *pos advances.
++ */
++uint32_t a135f_log_copy(uint64_t *pos, char *out, uint32_t max);
++
++uint32_t
++a135f_log_copy(uint64_t *pos, char *out, uint32_t max)
++{
++	uint64_t total = os_atomic_load(&a135f_log_total, relaxed);
++	if (total - *pos > A135F_LOG_SIZE) {
++		*pos = total - A135F_LOG_SIZE;
++	}
++	uint32_t n = (uint32_t)MIN((uint64_t)max, total - *pos);
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = a135f_log_ring[(*pos + i) % A135F_LOG_SIZE];
++	}
++	*pos += n;
++	return n;
++}
++
++uint64_t a135f_log_position(void);
++
++uint64_t
++a135f_log_position(void)
++{
++	return os_atomic_load(&a135f_log_total, relaxed);
++}
++
++struct a135f_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++a135f_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = su.first_block + su.nblocks - A135F_LOG_BLOCKS;
++	uint64_t flushed = 0, seq = 0;
++	static uint8_t hdrblk[DEV_BLOCK];
++
++	printf("A135F LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
++	    A135F_LOG_BLOCKS * DEV_BLOCK >> 10, base);
++	for (;;) {
++		(void)tsleep(&a135f_log_chan, PZERO, "a135f_log", hz * (int)a135f_log_secs);
++		uint64_t total = os_atomic_load(&a135f_log_total, relaxed);
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t pos = total - flushed >= A135F_LOG_SIZE ? total - A135F_LOG_SIZE : flushed;
++		int error = 0;
++
++		lck_mtx_lock(&a135f_mmc_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % A135F_LOG_SIZE);
++			uint32_t blk = off / DEV_BLOCK;
++			uint64_t need = ((uint64_t)off % DEV_BLOCK + (total - pos) + DEV_BLOCK - 1) / DEV_BLOCK;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(A135F_LOG_SIZE / DEV_BLOCK - blk)),
++			    (uint64_t)(BOUNCE_SIZE / DEV_BLOCK));
++			dma_put(DMA_BOUNCE, a135f_log_ring + (uint64_t)blk * DEV_BLOCK, n * DEV_BLOCK);
++			error = mmc_write_blocks(base + 1 + blk, n);
++			pos += (uint64_t)(blk + n) * DEV_BLOCK - off;
++		}
++		if (!error) {
++			struct a135f_log_header h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = A135F_LOG_SIZE, .total = total, .seq = ++seq,
++			};
++			bzero(hdrblk, DEV_BLOCK);
++			memcpy(hdrblk, &h, sizeof(h));
++			dma_put(DMA_BOUNCE, hdrblk, DEV_BLOCK);
++			error = mmc_write_blocks(base, 1);
++		}
++		if (!error) {
++			error = mmc_sync_cache();
++		}
++		lck_mtx_unlock(&a135f_mmc_lock);
++		if (error) {
++			printf("A135F LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++a135f_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("a135f_log", &on, sizeof(on));
++	if (!on || !su.writable || su.nblocks < 2 * A135F_LOG_BLOCKS) {
++		return;
++	}
++	PE_parse_boot_argn("mmclogsecs", &a135f_log_secs, sizeof(a135f_log_secs));
++	if (a135f_log_secs == 0 || a135f_log_secs > 60) {
++		a135f_log_secs = A135F_LOG_SECS;
++	}
++	if (kernel_thread_start(a135f_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/* Root device for rd=mmcroot0 (IOFindBSDRoot). */
++int a135f_mmc_rootdev(dev_t *dev);
++
++int
++a135f_mmc_rootdev(dev_t *dev)
++{
++	if (!su.ready) {
++		int error = a135f_mmc_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = su.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/bsd/dev/a135f_ufs.c b/bsd/dev/a135f_ufs.c
+deleted file mode 100644
+index 86b1a6b..0000000
+--- a/bsd/dev/a135f_ufs.c
++++ /dev/null
+@@ -1,823 +0,0 @@
+-/*
+- * A135F internal UFS root device.
+- *
+- * The Qualcomm UFS host (UFSHCI 2.1) is left enabled with the link up by the
+- * bootloader, which loaded our boot image from it. This driver reuses that
+- * state: it points the transfer request list at its own memory (verifying the
+- * host took it before ringing any doorbell) and issues polled SCSI commands,
+- * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
+- * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
+- * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
+- * Root on it with rd=ufsroot0.
+- *
+- * All DMA goes through one physically contiguous allocation (descriptors and
+- * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
+- * cleaned/invalidated around each command.
+- *
+- * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+- * against the partition bounds again right before it is issued, so nothing
+- * outside the named partition can be written.
+- */
+-#if defined(ARM64_BOARD_CONFIG_A135F)
+-#include <sys/param.h>
+-#include <sys/systm.h>
+-#include <sys/buf.h>
+-#include <sys/conf.h>
+-#include <sys/disk.h>
+-#include <sys/errno.h>
+-#include <sys/proc.h>
+-#include <sys/uio.h>
+-#include <miscfs/devfs/devfs.h>
+-#include <kern/locks.h>
+-#include <kern/clock.h>
+-#include <kern/sched_prim.h>
+-#include <machine/machine_routines.h>
+-#include <arm/caches_internal.h>
+-#include <vm/pmap.h>
+-#include <vm/vm_kern.h>
+-#include <pexpert/pexpert.h>
+-#include <pexpert/device_tree.h>
+-#include <libkern/libkern.h>
+-#include <machine/atomic.h>
+-
+-extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+-/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+-extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+-/* osfmk/arm/cpu_data.h, not exported to the BSD layer */
+-extern int get_preemption_level(void);
+-extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+-extern void thread_deallocate(thread_t);
+-extern int hz;
+-static void a135f_log_start(void);
+-extern void a135f_sample_start(void);
+-extern void a135f_keys_init(void);
+-extern void a135f_touch_init(void);
+-extern void a135f_usb_probe(void);
+-
+-#define REG_CAP         0x00
+-#define REG_IS          0x20
+-#define REG_IE          0x24
+-#define REG_HCS         0x30
+-#define REG_HCE         0x34
+-#define REG_UTRLBA      0x50
+-#define REG_UTRLBAU     0x54
+-#define REG_UTRLDBR     0x58
+-#define REG_UTRLCLR     0x5c
+-#define REG_UTRLRSR     0x60
+-
+-#define HCS_DP          (1u << 0)
+-#define HCS_UTRLRDY     (1u << 1)
+-#define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+-
+-#define UFS_BLOCK       4096u
+-#define BOUNCE_SIZE     (1u << 20)
+-#define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+-#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+-#define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+-#define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+-#define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+-
+-struct utrd {
+-	uint32_t dw0, dw1, dw2, dw3;
+-	uint32_t ucdba, ucdbau;
+-	uint32_t resp;          /* [31:16] response UPIU offset, [15:0] length, DWORDs */
+-	uint32_t prdt;          /* [31:16] PRDT offset (DWORDs), [15:0] entries */
+-};
+-
+-struct ucd {
+-	uint8_t cmd[512];
+-	uint8_t resp[512];
+-	struct {
+-		uint32_t addr_lo, addr_hi, rsvd, dbc;
+-	} prdt[PRDT_MAX];
+-};
+-
+-/* Layout of the contiguous DMA allocation. */
+-#define DMA_UTRL        0x0000                  /* 1 KiB aligned */
+-#define DMA_UCD         0x1000                  /* 128 byte aligned */
+-#define DMA_BOUNCE      0x4000
+-#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
+-
+-static struct {
+-	vm_offset_t regs;
+-	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+-	uint64_t dma_pa;
+-	uint8_t lun;
+-	uint8_t tag;
+-	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+-	uint32_t secsize;                       /* logical sector size for the BSD layer */
+-	bool writable;                          /* boot-arg ufsrw=1 */
+-	bool cache;                             /* boot-arg ufscache=1 */
+-	bool wait;                              /* boot-arg ufswait=1 */
+-	int bmajor, cmajor;
+-	dev_t bdev;
+-	bool ready;
+-} su;
+-
+-static LCK_GRP_DECLARE(a135f_ufs_grp, "a135f_ufs");
+-static LCK_MTX_DECLARE(a135f_ufs_lock, &a135f_ufs_grp);
+-
+-static inline uint32_t
+-ufs_rd(uint32_t off)
+-{
+-	return *(volatile uint32_t *)(su.regs + off);
+-}
+-
+-static inline void
+-ufs_wr(uint32_t off, uint32_t v)
+-{
+-	*(volatile uint32_t *)(su.regs + off) = v;
+-}
+-
+-static void
+-dma_sync(uint32_t off, uint32_t len)
+-{
+-	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+-}
+-
+-static void
+-dma_clean(uint32_t off, uint32_t len)
+-{
+-	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+-}
+-
+-/*
+- * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+- * (to the device when write is set). Returns 0 or an errno.
+- */
+-static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+-{
+-	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+-	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+-	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+-
+-	assert(len <= BOUNCE_SIZE);
+-	bzero(utrd, sizeof(*utrd));
+-	bzero(ucd, sizeof(*ucd));
+-
+-	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+-	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+-	ucd->cmd[2] = su.lun;
+-	ucd->cmd[3] = ++su.tag;
+-	ucd->cmd[12] = (uint8_t)(len >> 24);
+-	ucd->cmd[13] = (uint8_t)(len >> 16);
+-	ucd->cmd[14] = (uint8_t)(len >> 8);
+-	ucd->cmd[15] = (uint8_t)len;
+-	memcpy(&ucd->cmd[16], cdb, cdb_len);
+-
+-	/* DD: 1 = memory to device, 2 = device to memory. */
+-	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
+-	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+-	utrd->ucdba = (uint32_t)ucd_pa;
+-	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
+-	if (len) {
+-		uint32_t n = 0;
+-		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+-			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
+-		}
+-		utrd->prdt = (1024u / 4) << 16 | n;
+-	}
+-
+-	if (su.cache) {
+-		dma_clean(DMA_UTRL, sizeof(*utrd));
+-		dma_clean(DMA_UCD, 16 + cdb_len);
+-		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+-		if (len) {
+-			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
+-		}
+-	} else {
+-		dma_sync(DMA_UTRL, sizeof(*utrd));
+-		dma_sync(DMA_UCD, sizeof(*ucd));
+-	}
+-	if (len) {
+-		if (su.cache && write) {
+-			dma_clean(DMA_BOUNCE, len);
+-		} else {
+-			dma_sync(DMA_BOUNCE, len);
+-		}
+-	}
+-	__builtin_arm_dsb(0xf);
+-
+-	ufs_wr(REG_UTRLDBR, 1);
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
+-	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
+-	    !ml_at_interrupt_context() && get_preemption_level() == 0;
+-	uint64_t spin_until = 0, sleep_interval = 0;
+-	if (sleepable) {
+-		nanoseconds_to_absolutetime(CMD_SPIN_NS, &spin_until);
+-		spin_until += mach_absolute_time();
+-		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+-	}
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
+-		uint64_t now = mach_absolute_time();
+-		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("A135F UFS: command 0x%02x timed out\n", cdb[0]);
+-			return ETIMEDOUT;
+-		}
+-		if (sleepable && now >= spin_until) {
+-			uint64_t wake = now + MIN(sleep_interval, deadline - now);
+-			/* Keep the mutex: slot 0 and the bounce buffer are still owned. */
+-			if (assert_wait_deadline_with_leeway((event_t)&su.wait, THREAD_UNINT,
+-			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+-				thread_block(THREAD_CONTINUE_NULL);
+-			}
+-		} else {
+-			delay(1);
+-		}
+-	}
+-	__builtin_arm_dsb(0xf);
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
+-
+-	dma_sync(DMA_UTRL, sizeof(*utrd));
+-	if (su.cache) {
+-		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+-	} else {
+-		dma_sync(DMA_UCD, sizeof(*ucd));
+-	}
+-	if (len && !(su.cache && write)) {
+-		dma_sync(DMA_BOUNCE, len);
+-	}
+-
+-	uint32_t ocs = utrd->dw2 & 0xff;
+-	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+-		printf("A135F UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+-		return EIO;
+-	}
+-	return 0;
+-}
+-
+-/* READ(10) of count device blocks at lba into the bounce buffer. */
+-static int
+-ufs_read_blocks(uint64_t lba, uint32_t count)
+-{
+-	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+-		return EINVAL;
+-	}
+-	uint8_t cdb[10] = {
+-		0x28, 0,
+-		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+-		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+-	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
+-}
+-
+-/*
+- * WRITE(10) of count device blocks from the bounce buffer to lba. The range
+- * must lie inside the partition: this is the only place data goes out.
+- */
+-static int
+-ufs_write_blocks(uint64_t lba, uint32_t count)
+-{
+-	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+-	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+-	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
+-		printf("A135F UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+-		return EPERM;
+-	}
+-	uint8_t cdb[10] = {
+-		0x2a, 0,
+-		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+-		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+-	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
+-}
+-
+-static int
+-ufs_sync_cache(void)
+-{
+-	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+-	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+-}
+-
+-static int
+-ufs_find_partition(const char *want)
+-{
+-	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
+-	if (error) {
+-		return error;
+-	}
+-	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("A135F UFS: LUN %u has no GPT\n", su.lun);
+-		return ENXIO;
+-	}
+-	uint64_t entry_lba;
+-	uint32_t nent, esz;
+-	memcpy(&entry_lba, b + 72, 8);
+-	memcpy(&nent, b + 80, 4);
+-	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+-		printf("A135F UFS: unsupported GPT entries %u x %u\n", nent, esz);
+-		return ENXIO;
+-	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
+-	if (error) {
+-		return error;
+-	}
+-	for (uint32_t i = 0; i < nent; i++) {
+-		const uint8_t *e = b + i * esz;
+-		char name[37];
+-		unsigned c;
+-		for (c = 0; c < 36; c++) {
+-			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
+-			if (ch == 0 || ch > 0x7f) {
+-				break;
+-			}
+-			name[c] = (char)ch;
+-		}
+-		name[c] = 0;
+-		if (strcmp(name, want) != 0) {
+-			continue;
+-		}
+-		uint64_t first, last;
+-		memcpy(&first, e + 32, 8);
+-		memcpy(&last, e + 40, 8);
+-		if (last < first) {
+-			return ENXIO;
+-		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
+-		return 0;
+-	}
+-	printf("A135F UFS: no GPT partition named \"%s\"\n", want);
+-	return ENOENT;
+-}
+-
+-static int
+-ufs_take_over_host(void)
+-{
+-	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+-	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+-		printf("A135F UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+-		return ENXIO;
+-	}
+-	if (ufs_rd(REG_UTRLDBR)) {
+-		printf("A135F UFS: requests outstanding from the bootloader\n");
+-		return EBUSY;
+-	}
+-	/* With RAM above 4 GiB (mkadt.py --highmem) the DMA memory can be there too. */
+-	if (((su.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
+-		printf("A135F UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
+-		    su.dma_pa);
+-		return ENXIO;
+-	}
+-	ufs_wr(REG_IE, 0);                      /* polled operation */
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));
+-	ufs_wr(REG_UTRLRSR, 0);
+-	uint64_t list = su.dma_pa + DMA_UTRL;
+-	ufs_wr(REG_UTRLBA, (uint32_t)list);
+-	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
+-	ufs_wr(REG_UTRLRSR, 1);
+-	/* Never ring a doorbell unless the host uses our list. */
+-	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+-	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+-		printf("A135F UFS: host did not take our request list\n");
+-		return EIO;
+-	}
+-	return 0;
+-}
+-
+-static int
+-a135f_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+-{
+-	if (!su.ready) {
+-		return ENXIO;
+-	}
+-	return ((flags & FWRITE) && !su.writable) ? EROFS : 0;
+-}
+-
+-static int
+-a135f_ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+-{
+-	return 0;
+-}
+-
+-static void
+-a135f_ufs_strategy(buf_t bp)
+-{
+-	int error = 0;
+-	caddr_t vaddr = NULL;
+-	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
+-	uint32_t count = buf_count(bp);
+-	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+-
+-	bool rd = buf_flags(bp) & B_READ;
+-
+-	buf_setresid(bp, count);
+-	if (!rd && !su.writable) {
+-		error = EROFS;
+-		goto done;
+-	}
+-	if (off > part_bytes || count > part_bytes - off) {
+-		error = EINVAL;
+-		goto done;
+-	}
+-	if (count == 0) {
+-		goto done;
+-	}
+-	if (buf_map(bp, &vaddr)) {
+-		error = EIO;
+-		goto done;
+-	}
+-
+-	lck_mtx_lock(&a135f_ufs_lock);
+-	for (uint32_t done = 0; done < count;) {
+-		uint64_t pos = off + done;
+-		uint64_t lba = pos / UFS_BLOCK;
+-		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+-		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
+-		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+-		void *bounce = (void *)(su.dma + DMA_BOUNCE);
+-		if (rd) {
+-			error = ufs_read_blocks(su.first_block + lba, blocks);
+-			if (!error) {
+-				memcpy(vaddr + done, (const char *)bounce + skip, want);
+-			}
+-		} else {
+-			/* Partial device blocks at either end: read, merge, write back. */
+-			if (skip || (want % UFS_BLOCK)) {
+-				error = ufs_read_blocks(su.first_block + lba, blocks);
+-			}
+-			if (!error) {
+-				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(su.first_block + lba, blocks);
+-			}
+-		}
+-		if (error) {
+-			break;
+-		}
+-		done += want;
+-		buf_setresid(bp, count - done);
+-	}
+-	lck_mtx_unlock(&a135f_ufs_lock);
+-	buf_unmap(bp);
+-
+-done:
+-	if (error) {
+-		buf_seterror(bp, error);
+-	}
+-	buf_biodone(bp);
+-}
+-
+-static int
+-a135f_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+-    __unused struct proc *p, int is_char)
+-{
+-	uint32_t *f = (uint32_t *)data;
+-	uint64_t *o = (uint64_t *)data;
+-
+-	switch (cmd) {
+-	case DKIOCGETBLOCKSIZE:
+-		*f = su.secsize;
+-		return 0;
+-	case DKIOCSETBLOCKSIZE:
+-		if (is_char) {
+-			return ENODEV;
+-		}
+-		if (*f < DEV_BSIZE || *f > UFS_BLOCK || (*f & (*f - 1))) {
+-			return EINVAL;
+-		}
+-		su.secsize = *f;
+-		return 0;
+-	case DKIOCGETPHYSICALBLOCKSIZE:
+-		*f = UFS_BLOCK;
+-		return 0;
+-	case DKIOCGETBLOCKCOUNT:
+-		*o = su.nblocks * UFS_BLOCK / su.secsize;
+-		return 0;
+-	case DKIOCISWRITABLE:
+-		*f = su.writable;
+-		return 0;
+-	case DKIOCSYNCHRONIZE:
+-	case DKIOCSYNCHRONIZECACHE: {
+-		if (!su.writable) {
+-			return 0;
+-		}
+-		lck_mtx_lock(&a135f_ufs_lock);
+-		int error = ufs_sync_cache();
+-		lck_mtx_unlock(&a135f_ufs_lock);
+-		return error;
+-	}
+-	case DKIOCGETMAXBLOCKCOUNTREAD:
+-		*o = BOUNCE_SIZE / su.secsize;
+-		return 0;
+-	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
+-		return 0;
+-	case DKIOCGETMAXSEGMENTCOUNTREAD:
+-	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+-		*o = 1;
+-		return 0;
+-	default:
+-		return ENOTTY;
+-	}
+-}
+-
+-static int
+-a135f_ufs_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+-{
+-	return a135f_ufs_ioctl(dev, cmd, data, flag, p, 0);
+-}
+-
+-static int
+-a135f_ufs_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+-{
+-	return a135f_ufs_ioctl(dev, cmd, data, flag, p, 1);
+-}
+-
+-static int
+-a135f_ufs_psize(__unused dev_t dev)
+-{
+-	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+-}
+-
+-static int
+-a135f_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
+-{
+-	return physio(a135f_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
+-}
+-
+-static int
+-a135f_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
+-{
+-	if (!su.writable) {
+-		return EROFS;
+-	}
+-	return physio(a135f_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
+-}
+-
+-static const struct bdevsw a135f_ufs_bdevsw = {
+-	.d_open     = a135f_ufs_open,
+-	.d_close    = a135f_ufs_close,
+-	.d_strategy = a135f_ufs_strategy,
+-	.d_ioctl    = a135f_ufs_bioctl,
+-	.d_dump     = eno_dump,
+-	.d_psize    = a135f_ufs_psize,
+-	.d_type     = D_DISK,
+-};
+-
+-static const struct cdevsw a135f_ufs_cdevsw = {
+-	.d_open       = a135f_ufs_open,
+-	.d_close      = a135f_ufs_close,
+-	.d_read       = a135f_ufs_read,
+-	.d_write      = a135f_ufs_write,
+-	.d_ioctl      = a135f_ufs_cioctl,
+-	.d_stop       = eno_stop,
+-	.d_reset      = eno_reset,
+-	.d_ttys       = NULL,
+-	.d_select     = eno_select,
+-	.d_mmap       = eno_mmap,
+-	.d_strategy   = eno_strat,
+-	.d_reserved_1 = eno_getc,
+-	.d_reserved_2 = eno_putc,
+-	.d_type       = D_DISK,
+-};
+-
+-static int
+-a135f_ufs_init(void)
+-{
+-	DTEntry node;
+-	uintptr_t const *reg = NULL;
+-	unsigned int size = 0;
+-	char want[64] = "userdata";
+-	int error;
+-
+-	if (SecureDTLookupEntry(NULL, "/a135f-ufs", &node) != kSuccess ||
+-	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+-	    size < 2 * sizeof(uintptr_t)) {
+-		printf("A135F UFS: no /a135f-ufs node in the device tree\n");
+-		return ENXIO;
+-	}
+-	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+-	uint32_t rw = 0;
+-	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	uint32_t cache = 0, wait = 0;
+-	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+-	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+-	su.cache = (cache == 1);
+-	su.wait = (wait == 1);
+-
+-	su.regs = ml_io_map(reg[0], reg[1]);
+-	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("A135F UFS: no contiguous DMA memory\n");
+-		return ENOMEM;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+-	if (!pn) {
+-		return ENOMEM;
+-	}
+-	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
+-	su.secsize = DEV_BSIZE;
+-
+-	lck_mtx_lock(&a135f_ufs_lock);
+-	error = ufs_take_over_host();
+-	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+-		}
+-	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
+-	}
+-	lck_mtx_unlock(&a135f_ufs_lock);
+-	if (error) {
+-		return error;
+-	}
+-
+-	su.bmajor = bdevsw_add(-1, &a135f_ufs_bdevsw);
+-	if (su.bmajor < 0) {
+-		return ENXIO;
+-	}
+-	su.cmajor = cdevsw_add_with_bdev(-1, &a135f_ufs_cdevsw, su.bmajor);
+-	if (su.cmajor < 0) {
+-		return ENXIO;
+-	}
+-	su.bdev = makedev(su.bmajor, 0);
+-	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+-	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+-	/* Only now, with the partition bounds known, can writes be allowed. */
+-	su.writable = (rw != 0);
+-	su.ready = true;
+-	printf("A135F UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+-	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+-	    su.writable ? "read-write" : "read-only", su.dma_pa);
+-	a135f_log_start();
+-	a135f_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/A135FHID.cpp). */
+-	a135f_keys_init();
+-	a135f_touch_init();
+-	a135f_usb_probe();
+-	return 0;
+-}
+-
+-/*
+- * Persistent console log ("a135f_log"). Filming the phone screen is the only
+- * other way to see the console, so every character that reaches the
+- * console (kernel printf and /dev/console writes of daemons, both through
+- * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
+- * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
+- * the partition every ufslogsecs seconds (default 10), far behind the HFS
+- * image at its start. Device block 0 of that area is a header:
+- *   "A135FLOG" | u32 version 1 | u32 ring size | u64 total bytes written
+- *   | u64 flush sequence
+- * ring offset of byte n = n % ring size. Read it from a recovery with
+- * tools/a135f-log-pull.sh. Disabled with boot-arg a135f_log=0.
+- */
+-#define A135F_LOG_SIZE          (4u << 20)
+-#define A135F_LOG_BLOCKS        (1 + A135F_LOG_SIZE / UFS_BLOCK)
+-#define A135F_LOG_SECS          10u
+-
+-static char a135f_log_ring[A135F_LOG_SIZE];
+-static uint64_t _Atomic a135f_log_total;
+-static int a135f_log_chan;
+-static uint32_t a135f_log_secs = A135F_LOG_SECS;
+-
+-/* Called for all console output, any context: never blocks. */
+-void a135f_log_append(const char *c, int size);
+-
+-void
+-a135f_log_append(const char *c, int size)
+-{
+-	if (size <= 0) {
+-		return;
+-	}
+-	uint64_t at = os_atomic_add_orig(&a135f_log_total, (uint64_t)size, relaxed);
+-	for (int i = 0; i < size; i++) {
+-		a135f_log_ring[(at + (uint64_t)i) % A135F_LOG_SIZE] = c[i];
+-	}
+-}
+-
+-/*
+- * Copy console bytes [*pos, total) (at most max) for live log streaming
+- * (a135f_usb.c). A reader that fell more than the ring behind skips ahead.
+- * Returns the byte count; *pos advances.
+- */
+-uint32_t a135f_log_copy(uint64_t *pos, char *out, uint32_t max);
+-
+-uint32_t
+-a135f_log_copy(uint64_t *pos, char *out, uint32_t max)
+-{
+-	uint64_t total = os_atomic_load(&a135f_log_total, relaxed);
+-	if (total - *pos > A135F_LOG_SIZE) {
+-		*pos = total - A135F_LOG_SIZE;
+-	}
+-	uint32_t n = (uint32_t)MIN((uint64_t)max, total - *pos);
+-	for (uint32_t i = 0; i < n; i++) {
+-		out[i] = a135f_log_ring[(*pos + i) % A135F_LOG_SIZE];
+-	}
+-	*pos += n;
+-	return n;
+-}
+-
+-uint64_t a135f_log_position(void);
+-
+-uint64_t
+-a135f_log_position(void)
+-{
+-	return os_atomic_load(&a135f_log_total, relaxed);
+-}
+-
+-struct a135f_log_header {
+-	char magic[8];
+-	uint32_t version, size;
+-	uint64_t total, seq;
+-};
+-
+-static void
+-a135f_log_thread(__unused void *arg, __unused wait_result_t wr)
+-{
+-	uint64_t base = su.first_block + su.nblocks - A135F_LOG_BLOCKS;
+-	uint64_t flushed = 0, seq = 0;
+-	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+-
+-	printf("A135F LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+-	    A135F_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+-	for (;;) {
+-		(void)tsleep(&a135f_log_chan, PZERO, "a135f_log", hz * (int)a135f_log_secs);
+-		uint64_t total = os_atomic_load(&a135f_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
+-		uint64_t pos = total - flushed >= A135F_LOG_SIZE ? total - A135F_LOG_SIZE : flushed;
+-		int error = 0;
+-
+-		lck_mtx_lock(&a135f_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % A135F_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(A135F_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, a135f_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct a135f_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = A135F_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
+-		lck_mtx_unlock(&a135f_ufs_lock);
+-		if (error) {
+-			printf("A135F LOG: write failed (%d), stopping\n", error);
+-			return;
+-		}
+-		flushed = total;
+-	}
+-}
+-
+-static void
+-a135f_log_start(void)
+-{
+-	uint32_t on = 1;
+-	thread_t thread;
+-
+-	PE_parse_boot_argn("a135f_log", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * A135F_LOG_BLOCKS) {
+-		return;
+-	}
+-	PE_parse_boot_argn("ufslogsecs", &a135f_log_secs, sizeof(a135f_log_secs));
+-	if (a135f_log_secs == 0 || a135f_log_secs > 60) {
+-		a135f_log_secs = A135F_LOG_SECS;
+-	}
+-	if (kernel_thread_start(a135f_log_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	}
+-}
+-
+-/* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+-int a135f_ufs_rootdev(dev_t *dev);
+-
+-int
+-a135f_ufs_rootdev(dev_t *dev)
+-{
+-	if (!su.ready) {
+-		int error = a135f_ufs_init();
+-		if (error) {
+-			return error;
+-		}
+-	}
+-	*dev = su.bdev;
+-	return 0;
+-}
+-#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 0c675d4..caeebca 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -768,14 +768,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ //
+-//	A135F: root on a GPT partition of the internal UFS (bsd/dev/a135f_ufs.c)
++//	A135F: root on a GPT partition of the internal eMMC (bsd/dev/a135f_mmc.c)
+ //
+-	if (strcmp(rdBootVar, "ufsroot0") == 0) {
+-		extern int a135f_ufs_rootdev(dev_t *dev);
++	if (strcmp(rdBootVar, "mmcroot0") == 0) {
++		extern int a135f_mmc_rootdev(dev_t *dev);
+ 		OSSafeReleaseNULL(matching);
+-		int ufs_error = a135f_ufs_rootdev(root);
+-		if (ufs_error) {
+-			panic("IOFindBSDRoot: A135F UFS root %s unavailable: %d", rdBootVar, ufs_error);
++		int mmc_error = a135f_mmc_rootdev(root);
++		if (mmc_error) {
++			panic("IOFindBSDRoot: A135F eMMC root %s unavailable: %d", rdBootVar, mmc_error);
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));

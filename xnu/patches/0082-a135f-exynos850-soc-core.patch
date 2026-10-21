@@ -1,0 +1,619 @@
+diff --git a/iokit/Kernel/arm/A135FCPU.cpp b/iokit/Kernel/arm/A135FCPU.cpp
+index af5278e..641b82e 100644
+--- a/iokit/Kernel/arm/A135FCPU.cpp
++++ b/iokit/Kernel/arm/A135FCPU.cpp
+@@ -1,7 +1,8 @@
+ /*
+- * A55 SMP bring-up for a135f using XNU's legacy IOCPU interface and PSCI.
+- * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+- * CPU_OFF, suspend and the A76 cores still require separate platform work.
++ * Cortex-A55 SMP bring-up for the Galaxy A13 (Exynos850) using XNU's legacy
++ * IOCPU interface and PSCI. The architected timer and SGI1 already enter
++ * through pe_fiq/sleh_irq; IPIs are sent with the GIC-400 (GICv2) GICD_SGIR.
++ * CPU_OFF and suspend still require separate platform work.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -17,6 +18,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm/protos.h>
+ 
+ extern "C" void a135f_secondary_entry(void);
+ extern "C" boolean_t a135f_cpu_signal_is_enabled(unsigned int cpu);
+@@ -73,8 +75,8 @@ A135FCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/* Exynos850 MPIDR: Aff1 = cluster (0/1), Aff0 = core (0-3): 0x000-0x003, 0x100-0x103 */
++	if ((cpu->phys_id & ~0x103u) != 0 ||
+ 	    topology->num_cpus > A135F_SMP_MAX_CPUS) {
+ 		panic("A135F CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -82,7 +84,7 @@ A135FCPU::start(IOService *provider)
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy("Cortex-A55");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -214,19 +216,20 @@ A135FCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("A135F CPU: invalid SGI target %u", logical);
+ 	}
+-	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+-	uint64_t mpidr = topology->cpus[logical].phys_id;
+-	unsigned int aff0 = mpidr & 0xff;
+-	if (aff0 >= 16) {
+-		panic("A135F CPU: SGI target requires unsupported range selector");
++	/*
++	 * GICv2 SGIs are addressed by CPU interface number, not by MPIDR. Each CPU
++	 * records its own interface bit in pe_init_fiq(); before the target has
++	 * run it, fall back to the identity mapping (CPU interface n = logical
++	 * CPU n, as the Exynos850 device tree wires GIC_CPU_MASK_SIMPLE).
++	 */
++	uint32_t mask = a135f_gic_cpu_target[logical];
++	if (mask == 0) {
++		mask = 1U << logical;
+ 	}
+-	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+-	    (((mpidr >> 16) & 0xff) << 32) |
+-	    (((mpidr >> 8) & 0xff) << 16) |
+-	    ((uint64_t)A135F_IPI_SGI << 24) | (1ULL << aff0);
++	/* TargetListFilter 0 (use the list), CPUTargetList, SGI INTID */
+ 	__builtin_arm_dsb(DSB_ISHST);
+-	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+-	__builtin_arm_isb(ISB_SY);
++	*(volatile uint32_t *)(a135f_gicd_base + GICD_SGIR) = (mask << 16) | A135F_IPI_SGI;
++	__builtin_arm_dsb(DSB_SY);
+ }
+ 
+ kern_return_t
+diff --git a/iokit/Kernel/arm/A135FFramebuffer.cpp b/iokit/Kernel/arm/A135FFramebuffer.cpp
+index 9a2aff7..e3e2c0c 100644
+--- a/iokit/Kernel/arm/A135FFramebuffer.cpp
++++ b/iokit/Kernel/arm/A135FFramebuffer.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Built-in IOMobileFramebuffer for A135F: the ABL's continuous-splash
+- * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
++ * framebuffer (1080x2408 a8r8g8b8 in RAM, the panel scans it out by
+  * itself) as the main display, driven by CoreAnimation's CPU renderer.
+  *
+  * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
+@@ -75,7 +75,7 @@ enum {
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * centered 1080x2408 part of it is shown on the 1080x2408 panel.
+  * Boot-arg a135f_fb_native=1 presents the real panel size instead.
+  */
+ #define A135F_FB_LOGICAL_W              1125
+diff --git a/osfmk/arm64/a135f_early.c b/osfmk/arm64/a135f_early.c
+index e8da4d0..10fa02d 100644
+--- a/osfmk/arm64/a135f_early.c
++++ b/osfmk/arm64/a135f_early.c
+@@ -11,10 +11,10 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0xfa000000;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
++#define EARLY_HEIGHT 2408u
+ #define EARLY_STRIDE (4320u / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 94bba40..3217d20 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,7 +1843,7 @@ a135f_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = 0xfa000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 8137556..155647b 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -955,7 +955,7 @@ ml_parse_cpu_topology(void)
+ 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
+ 
+ #if defined(A135F)
+-	/* Opt in to SMP: cpus=N (N <= A135F_SMP_MAX_CPUS; cores 6-7 are the A76s). */
++	/* Opt in to SMP: cpus=N (N <= A135F_SMP_MAX_CPUS, eight Cortex-A55). */
+ 	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
+ 		cpu_boot_arg = 1;
+ 	}
+@@ -1088,9 +1088,10 @@ ml_parse_cpu_topology(void)
+ #endif
+ 
+ #if defined(A135F)
+-		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
++		/* Exynos850: Aff1 is the physical cluster (0/1), not an Apple cluster ID; all
++		 * eight cores are presented to the scheduler as one SMP cluster. */
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
+-		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
++		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->cpu_id);
+ #else
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", MPIDR_CLUSTER_ID(cpu->phys_id));
+ 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", MPIDR_CPU_ID(cpu->phys_id));
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0d62729..7b992dc 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1858,13 +1858,14 @@ sleh_irq(arm_saved_state_t *state)
+ 
+ #if defined(A135F)
+ 	/*
+-	 * a135f: TrustZone owns GIC Group 0, so the timer and IPIs that other
+-	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
++	 * a135f (Exynos850, GIC-400 = GICv2): TrustZone owns GIC Group 0, so the
++	 * timer and IPIs that other ARM64 targets take as FIQs arrive here as
++	 * Group 1 IRQs, acknowledged and ended through the MMIO CPU interface.
+ 	 */
+-	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	uint32_t iar = *(volatile uint32_t *)(a135f_gicc_base + GICC_IAR);
++	uint32_t intid = iar & 0x3FF; /* bits [12:10] are the SGI source CPU */
+ 
+-	if (intid >= 1020 && intid <= 1023) {
++	if (intid >= 1020) {
+ 		return; /* spurious */
+ 	}
+ 	if (intid == a135f_vtimer_intid) {
+@@ -1873,12 +1874,12 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		*(volatile uint32_t *)(a135f_gicc_base + GICC_EOIR) = iar;
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+-		__builtin_arm_isb(ISB_SY);
++		*(volatile uint32_t *)(a135f_gicc_base + GICC_EOIR) = iar;
++		__builtin_arm_dsb(DSB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+@@ -1888,8 +1889,9 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		*(volatile uint32_t *)(a135f_gicc_base + GICC_EOIR) = iar;
+ 	}
++	__builtin_arm_dsb(DSB_SY);
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 0095f2e..b1cda04 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,7 @@ LEXT(a135f_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
+-	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+-	mrs		x1, ICC_SRE_EL2
+-	orr		x1, x1, #1
+-	orr		x1, x1, #8
+-	msr		ICC_SRE_EL2, x1
++	/* GIC-400 is GICv2: MMIO CPU interface, no ICC_SRE_EL2 to program. */
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+@@ -515,7 +511,7 @@ LEXT(start_first_cpu)
+ 
+ #if defined(A135F)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (0xfa000000 + 2368 * 4320)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -683,10 +679,11 @@ Lkernelcache_base_found:
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+ 	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * A135F uses 16K pages and all bring-up RAM is below 4GB, so the first
++	 * A135F uses 16K pages; the framebuffer (0xfa000000) and the kernel RAM
++	 * (0x880000000, above 4GB) both have L1 index 0 (< 64GB), so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0xfa000000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 0240f57..6b42508 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -267,7 +267,7 @@ _cnputc(char c, bool poll)
+  * @param size The number of characters to print to the console.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+-extern void a135f_log_append(const char *c, int size);  /* bsd/dev/a135f_ufs.c */
++extern void a135f_log_append(const char *c, int size);  /* bsd/dev/a135f_mmc.c */
+ /*
+  * Set by AppleCLCD (boot-arg a135f_fb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 350adc7..f30ff0b 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -3,7 +3,6 @@
+  */
+ 
+ #include <stdint.h>
+-#include <libkern/section_keywords.h>
+ #include <arm64/proc_reg.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+@@ -17,11 +16,6 @@
+ #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
+ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS, MACHINE_TIMEOUT_UNIT_NSEC, NULL);
+ 
+-#if defined(A135F)
+-/* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+-SECURITY_READ_ONLY_LATE(uint32_t) a135f_vtimer_intid = A135F_VTIMER_INTID;
+-#endif
+-
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+ static vm_offset_t gicr_size;
+@@ -102,23 +96,6 @@ pe_init_fiq()
+ 			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
+ 		}
+ 
+-#if defined(A135F)
+-		/* Read only on the boot CPU, before the GIC and RO-late lockdown. */
+-		void const *timer_prop;
+-		unsigned int timer_size;
+-		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
+-			if (timer_size != sizeof(uint32_t)) {
+-				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
+-			}
+-			uint32_t intid = *(const uint32_t *)timer_prop;
+-			if (intid < 16 || intid >= 32) {
+-				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
+-			}
+-			a135f_vtimer_intid = intid;
+-		}
+-		kprintf("A135F GIC: virtual timer INTID %u\n", a135f_vtimer_intid);
+-#endif
+-
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+ 
+ 		uint64_t const gicd_base_prop = ((uint64_t const *) prop)[0];
+@@ -164,25 +141,11 @@ pe_init_fiq()
+ 		}
+ 	}
+ 
+-#if defined(A135F)
+-	/*
+-	 * Real hardware with two security states: Group 0 is TrustZone's and
+-	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+-	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
+-	 * from the non-secure side even after this write; delivery still works.
+-	 */
+-	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
+-	for (unsigned int i = 0; i < 32; i += 4) {
+-		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+-	}
+-	gicr_write32(GICR_ISENABLER0, (1U << a135f_vtimer_intid) | (1U << A135F_IPI_SGI));
+-#else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+ 
+ 	// Enable PPI 27
+ 	gicr_write32(GICR_ISENABLER0, (1 << 27));
+-#endif /* A135F */
+ 
+ 	// Enable system register access
+ 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
+@@ -190,12 +153,8 @@ pe_init_fiq()
+ 	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
+ 	__builtin_arm_isb(ISB_SY);
+ 
+-#if defined(A135F)
+-	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+-#else
+ 	// Set priority masks and binary point for group 0
+ 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
+-#endif /* A135F */
+ 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
+ 
+ 	// Set EOI mode of this processor
+@@ -203,24 +162,133 @@ pe_init_fiq()
+ 	icc_ctlr &= ~ICC_CTLR_EOIMODE;
+ 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+ 
+-#if defined(A135F)
+-	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
+-	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+-	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
+-	gicd_write32(GICD_CTLR, gicd_ctlr);
+-	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+-		;
+-	}
+-	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+-	__builtin_arm_isb(ISB_SY);
+-#else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+ 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
+ 	gicd_write32(GICD_CTLR, gicd_ctlr);
+ 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+-#endif /* A135F */
++}
++#elif defined(A135F)
++/*
++ * Samsung Galaxy A13 (Exynos850): ARM GIC-400, a GICv2 with the security
++ * extensions. The non-secure world sees Group 1 only; TrustZone has already
++ * routed the interrupts we use (the PPIs/SGIs and any SPI) to Group 1, which
++ * non-secure code cannot change. Each CPU enables its banked PPI/SGI state
++ * and its own CPU interface; the boot CPU also switches the distributor on.
++ */
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++SECURITY_READ_ONLY_LATE(uint32_t) a135f_vtimer_intid = A135F_VTIMER_INTID;
++SECURITY_READ_ONLY_LATE(vm_offset_t) a135f_gicd_base;
++SECURITY_READ_ONLY_LATE(vm_offset_t) a135f_gicc_base;
++/* GIC CPU interface bit (GICD_SGIR CPUTargetList) of each logical CPU, learned by that CPU. */
++volatile uint8_t a135f_gic_cpu_target[MAX_CPUS];
++
++static inline uint32_t
++gicd_read32(uint32_t off)
++{
++	return *(volatile uint32_t *)(a135f_gicd_base + off);
++}
++
++static inline void
++gicd_write32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a135f_gicd_base + off) = v;
++}
++
++static inline uint32_t
++gicc_read32(uint32_t off)
++{
++	return *(volatile uint32_t *)(a135f_gicc_base + off);
++}
++
++static inline void
++gicc_write32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a135f_gicc_base + off) = v;
++}
++
++void
++pe_init_fiq()
++{
++	// a135f_gicd_base is 0 only before the boot processor initializes it.
++	// Avoid the (not thread-safe) SecureDT* routines on secondary processors.
++	if (!a135f_gicd_base) {
++		DTEntry entry;
++		void const *prop;
++		unsigned int prop_size;
++
++		if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++		if (SecureDTGetProperty(entry, "reg", &prop, &prop_size) != kSuccess) {
++			panic("%s: cannot find GIC MMIO regions in DT", __func__);
++		}
++		// GICD base, GICD size, GICC base, GICC size (relative to the SoC base)
++		if (prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
++		}
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
++			if (timer_size != sizeof(uint32_t)) {
++				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
++			}
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			a135f_vtimer_intid = intid;
++		}
++		kprintf("A135F GIC: virtual timer INTID %u\n", a135f_vtimer_intid);
++
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++		uint64_t const *regs = (uint64_t const *)prop;
++
++		a135f_gicd_base = ml_io_map(soc_base_phys + regs[0], regs[1]);
++		if (!a135f_gicd_base) {
++			panic("%s: cannot map GICD region", __func__);
++		}
++		a135f_gicc_base = ml_io_map(soc_base_phys + regs[2], regs[3]);
++		if (!a135f_gicc_base) {
++			panic("%s: cannot map GICC region", __func__);
++		}
++
++		// Boot CPU: turn the distributor on (the bootloader leaves it as Linux expects to find it).
++		gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++		__builtin_arm_dsb(DSB_SY);
++	}
++
++	// Per-CPU (banked) PPI/SGI state: priority 0xa0 like Linux, enable the
++	// virtual timer PPI and the IPI SGI.
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR0 + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER0, (1U << a135f_vtimer_intid) | (1U << A135F_IPI_SGI));
++
++	// Our CPU interface bit: GICD_ITARGETSR0..7 are read-only and read back
++	// the calling CPU's interface mask in every byte (see Linux gic_get_cpumask()).
++	uint32_t mask = 0;
++	for (unsigned int i = 0; i < 32 && !mask; i += 4) {
++		mask = gicd_read32(GICD_ITARGETSR0 + i);
++		mask |= mask >> 16;
++		mask |= mask >> 8;
++		mask &= 0xff;
++	}
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (cpu < MAX_CPUS) {
++		a135f_gic_cpu_target[cpu] = (uint8_t)mask;
++	}
++
++	// CPU interface: unmask all but the lowest priorities, no preemption grouping, enable Group 1.
++	gicc_write32(GICC_PMR, 0xF0);
++	gicc_write32(GICC_BPR, 0);
++	uint32_t ctlr = gicc_read32(GICC_CTLR) & GICC_CTLR_DIS_BYPASS_MASK; // EOImode 0: EOIR also deactivates
++	gicc_write32(GICC_CTLR, ctlr | GICC_CTLR_ENABLEGRP1);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
+ }
+ #else
+ void
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index f932dd4..49aef1a 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,9 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ extern uint32_t a135f_vtimer_intid;
++extern vm_offset_t a135f_gicd_base;
++extern vm_offset_t a135f_gicc_base;
++extern volatile uint8_t a135f_gic_cpu_target[];
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/A135F.h b/pexpert/pexpert/arm64/A135F.h
+index c929329..4885251 100644
+--- a/pexpert/pexpert/arm64/A135F.h
++++ b/pexpert/pexpert/arm64/A135F.h
+@@ -1,12 +1,18 @@
+ /*
+- * Board config for the Samsung Galaxy A13 (SM-A135F) ("a135f", Qualcomm SM7150 /
+- * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
++ * Board config for the Samsung Galaxy A13 (SM-A135F): Samsung Exynos850
++ * (a.k.a. Exynos3830), eight Cortex-A55 in two clusters of four (MPIDR
++ * Aff1 = cluster, Aff0 = core: 0x000-0x003 and 0x100-0x103), ARMv8.2-A, no
++ * pointer authentication, 64-byte cache lines.
+  *
+  * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
+- * implementation-defined system registers exist), 16K pages and GICv3 like
+- * VMAPPLE. Unlike VMAPPLE the GIC has two security states (GICD_TYPER
+- * SecurityExtn=1): Group 0 belongs to TrustZone, so every interrupt,
+- * including the timer, is a Group 1 IRQ taken through sleh_irq().
++ * implementation-defined system registers exist) with 16K pages.
++ *
++ * Interrupt controller: ARM GIC-400 (GICv2), NOT GICv3. There is no system
++ * register CPU interface (no ICC_*), the CPU interface and the SGI trigger
++ * are MMIO. The GIC has two security states (TrustZone): Group 0 is the
++ * secure world's, the non-secure OS gets Group 1 only, so every interrupt,
++ * including the architected virtual timer, is taken as an IRQ through
++ * sleh_irq() and acknowledged with a read of GICC_IAR.
+  */
+ 
+ #ifndef _PEXPERT_ARM64_A135F_H
+@@ -18,10 +24,8 @@
+ #define A135F                     1
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+- * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+- * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+- * clusters yet).
++ * All eight A55 cores as one homogeneous SMP cluster: cpus=N is clamped
++ * here. PSCI CPU_ON through the Samsung EL3 monitor (smc).
+  */
+ #define A135F_SMP_MAX_CPUS         8
+ 
+@@ -36,48 +40,40 @@
+ #define __ARM_PAN_AVAILABLE__     1
+ #define __ARM_16K_PG__            1
+ 
+-#define HAS_GIC_V3                1
++/* GICv2 (GIC-400): see pexpert/arm/pe_fiq.c. HAS_GIC_V3 is deliberately unset. */
++#define A135F_GIC_V2              1
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+ #endif /* ! ASSEMBLER */
+ 
+ /*
+- * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
+- * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+- * (CNTV) is INTID 16 + 3 = 19.
++ * Exynos850 wires the architected timer PPIs the standard way (secure phys
++ * 13, non-secure phys 14, virtual 11, hyp 10); the virtual timer XNU uses
++ * (CNTV) is INTID 16 + 11 = 27. mkadt.py can override it through the
++ * "virtual-timer-intid" property of the ADT gic node.
+  */
+-#define A135F_VTIMER_INTID        19
++#define A135F_VTIMER_INTID        27
+ #define A135F_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+ 
+-#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
+-
+-/* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
+-#define GICD_CTLR                 0x0
+-
+-/* Non-secure view of GICD_CTLR (DS=0) */
+-#define GICD_CTLR_ENABLEGRP1      0x1
+-#define GICD_CTLR_ENABLEGRP1A     0x2
+-#define GICD_CTLR_ARE_NS          0x10
+-#define GICD_CTLR_RWP             0x80000000
+-
+-#define GICR_TYPER                              0x08
+-#define GICR_WAKER                              0x14
+-#define GICR_IGROUPR0                           0x10080
+-#define GICR_ISENABLER0                         0x10100
+-#define GICR_IPRIORITYR0                        0x10400
+-
+-#define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
+-#define GICR_TYPER_LAST                         0x10
+-
+-#define GICR_WAKER_PROCESSORSLEEP               0x2
+-#define GICR_WAKER_CHILDRENASLEEP               0x4
+-
+-#define ICC_CTLR_EOIMODE                        0x2
+-
+-#define ICC_SRE_SRE                             0x1
+-/* End of GICv3 register definitions */
++/* GIC-400 distributor (Arm IHI 0048B); offsets from the GICD base */
++#define GICD_CTLR                 0x000
++#define GICD_CTLR_ENABLEGRP1      0x1     /* non-secure view: enable Group 1 */
++#define GICD_ISENABLER0           0x100   /* SGIs/PPIs: banked per CPU */
++#define GICD_ICENABLER0           0x180
++#define GICD_IPRIORITYR0          0x400
++#define GICD_ITARGETSR0           0x800   /* first 32 are read-only, banked: own CPU interface */
++#define GICD_SGIR                 0xF00
++
++/* GIC-400 CPU interface; offsets from the GICC base */
++#define GICC_CTLR                 0x00
++#define GICC_CTLR_ENABLEGRP1      0x1
++#define GICC_CTLR_DIS_BYPASS_MASK 0x1e0   /* preserve the bypass-disable bits */
++#define GICC_PMR                  0x04
++#define GICC_BPR                  0x08
++#define GICC_IAR                  0x0c
++#define GICC_EOIR                 0x10
+ 
+ #endif /* ! _PEXPERT_ARM64_A135F_H */

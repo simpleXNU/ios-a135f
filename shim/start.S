@@ -1,6 +1,7 @@
 /*
- * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
- * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
+ * a135f boot shim entry: arm64 Linux Image header so the Samsung bootloader
+ * treats us like a kernel. It enters with the MMU/D-cache off, x0 = DTB
+ * pointer, at EL1 or EL2 (we handle both and always hand XNU an EL1 CPU).
  */
 	.section .text.head, "ax"
 	.globl _head
@@ -20,8 +21,38 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
-	mov	x19, x0			/* DTB pointer from ABL */
-	msr	spsel, #1
+	mov	x19, x0			/* DTB pointer from the bootloader */
+	mrs	x1, CurrentEL
+	lsr	x1, x1, #2
+	adr	x2, shim_entry_el
+	str	x1, [x2]
+	cmp	x1, #2
+	b.ne	1f
+	/* EL2 -> EL1: no resident hypervisor is assumed. */
+	mrs	x1, midr_el1
+	msr	vpidr_el2, x1		/* EL1 reads of MIDR/MPIDR return these */
+	mrs	x1, mpidr_el1
+	msr	vmpidr_el2, x1
+	mov	x1, #(1 << 31)		/* HCR_EL2.RW: EL1 is AArch64, nothing trapped */
+	msr	hcr_el2, x1
+	msr	vttbr_el2, xzr
+	mov	x1, #0x33ff		/* CPTR_EL2 RES1 only: no FP/SIMD traps */
+	msr	cptr_el2, x1
+	msr	mdcr_el2, xzr
+	mrs	x1, cnthctl_el2
+	orr	x1, x1, #3		/* EL1 may use the physical counter/timer */
+	msr	cnthctl_el2, x1
+	msr	cntvoff_el2, xzr
+	mov	x1, #0x0800		/* SCTLR_EL1: RES1 bits, MMU/caches off, little endian */
+	movk	x1, #0x30d0, lsl #16
+	msr	sctlr_el1, x1
+	isb
+	adr	x1, 1f
+	msr	elr_el2, x1
+	mov	x1, #0x3c5		/* DAIF masked, EL1h */
+	msr	spsr_el2, x1
+	eret
+1:	msr	spsel, #1
 	adr	x1, _stack_top
 	mov	sp, x1
 	adr	x1, vectors
@@ -30,30 +61,20 @@ _start:
 	/* zero .bss */
 	adr	x1, _bss_start
 	adr	x2, _bss_end
-1:	cmp	x1, x2
-	b.hs	2f
+2:	cmp	x1, x2
+	b.hs	3f
 	str	xzr, [x1], #8
-	b	1b
-2:	mov	x0, x19
+	b	2b
+3:	mov	x0, x19
 	bl	shim_main
-3:	wfe
-	b	3b
-
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
-	.globl secondary_entry
-secondary_entry:
-	msr	daifset, #0xf
-	msr	spsel, #1
-	adr	x1, _sec_stacks
-	add	x1, x1, x0, lsl #12
-	add	x1, x1, #0x1000
-	mov	sp, x1
-	adr	x1, vectors
-	msr	vbar_el1, x1
-	isb
-	bl	secondary_main
 4:	wfe
 	b	4b
+
+	.data
+	.balign 8
+	.globl shim_entry_el
+shim_entry_el:	.quad	0		/* exception level the bootloader entered us at */
+	.text
 
 /*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number
