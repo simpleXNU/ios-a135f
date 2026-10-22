@@ -59,7 +59,7 @@ def stub(ba_pa, entry_pa):
     return struct.pack('<4I2Q', 0x58000080, 0x580000a1, 0xd61f0020, 0xd503201f, ba_pa, entry_pa)
 
 
-def write_png(path, raw):
+def png_bytes(raw, level=6):
     rows = []
     for y in range(FB_H):
         line = raw[y * FB_STRIDE:(y + 1) * FB_STRIDE]
@@ -68,8 +68,66 @@ def write_png(path, raw):
         rows.append(b'\0' + bytes(rgb))
     chunk = lambda t, d: struct.pack('>I', len(d)) + t + d + struct.pack('>I', zlib.crc32(t + d))
     png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', FB_W, FB_H, 8, 2, 0, 0, 0))
-    png += chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b'')
-    open(path, 'wb').write(png)
+    png += chunk(b'IDAT', zlib.compress(b''.join(rows), level)) + chunk(b'IEND', b'')
+    return png
+
+
+def write_png(path, raw):
+    open(path, 'wb').write(png_bytes(raw))
+
+
+LIVE_PAGE = b"""<!doctype html><meta charset=utf-8><title>A135F in QEMU</title>
+<body style="margin:0;background:#1b1b1b;color:#bbb;font:13px sans-serif">
+<div style="padding:4px 8px">live framebuffer (1080x2408) &middot; <span id=f>connecting</span> &middot; Ctrl-C in the terminal to stop</div>
+<img id=i style="height:calc(100vh - 30px)">
+<script>
+let n = 0, prev = null;
+async function tick() {
+  try {
+    const r = await fetch('/fb.png?' + Date.now());
+    const u = URL.createObjectURL(await r.blob());
+    document.getElementById('i').src = u;
+    if (prev) URL.revokeObjectURL(prev);
+    prev = u;
+    document.getElementById('f').textContent = 'frame ' + (++n);
+  } catch (e) { document.getElementById('f').textContent = 'waiting for QEMU...'; }
+  setTimeout(tick, 400);
+}
+tick();
+</script>"""
+
+
+def serve_live(mon, out, bind, port):
+    """Serve the guest framebuffer at http://bind:port/ (read with QMP pmemsave, VM keeps running)."""
+    import http.server, threading
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith('/fb.png'):
+                try:
+                    with lock:
+                        qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/live.raw'))
+                        raw = open(f'{out}/live.raw', 'rb').read()
+                    body, ctype = png_bytes(raw, 1), 'image/png'
+                except Exception:
+                    self.send_error(503)
+                    return
+            else:
+                body, ctype = LIVE_PAGE, 'text/html'
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer((bind, port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
 
 
 def payload_data(payload, va, size):
@@ -154,6 +212,9 @@ def main():
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a55')	# ARMv8.2 like the Exynos850 A55, same ID_AA64MMFR0
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
+    ap.add_argument('--live', nargs='?', const=8080, type=int, metavar='PORT',
+                    help='show the screen live in a browser at http://localhost:PORT (default 8080); runs until Ctrl-C or QEMU exits')
+    ap.add_argument('--live-bind', default='127.0.0.1', help='address for --live (use 0.0.0.0 if the browser cannot reach it)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     a = ap.parse_args()
     if a.fail_on_panic and not a.kernel:
@@ -195,8 +256,18 @@ def main():
         p.wait()
         return
     t0 = time.time()
-    while p.poll() is None and time.time() - t0 < a.secs:
-        time.sleep(0.2)
+    if a.live:
+        for _ in range(100):
+            if os.path.exists(mon):
+                break
+            time.sleep(0.1)
+        serve_live(mon, out, a.live_bind, a.live)
+        print(f'live screen: http://localhost:{a.live}  (Ctrl-C to stop; a final snapshot is still written)', file=sys.stderr)
+    try:
+        while p.poll() is None and (a.live or time.time() - t0 < a.secs):
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print('stopping...', file=sys.stderr)
     result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
     if p.poll() is None:
         _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
@@ -213,8 +284,9 @@ def main():
         os.unlink(f'{out}/fb.raw')
     else:
         print(f'qemu exited early: {p.returncode}', file=sys.stderr)
-    for f in ('ram.bin',):
-        os.unlink(f'{out}/{f}')
+    for f in ('ram.bin', 'live.raw'):
+        if os.path.exists(f'{out}/{f}'):
+            os.unlink(f'{out}/{f}')
     open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result), file=sys.stderr)
     print(f'{out}/fb.png  {out}/regs.txt  {out}/qemu.log', file=sys.stderr)
