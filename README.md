@@ -64,6 +64,15 @@ tools/mkiosroot.sh \
 6. **Logs:** the kernel keeps a 4 MiB console ring at the end of `userdata`; read it from recovery/pmOS with
    `tools/a135f-log-pull.sh`. The shim also paints a status/panic screen on the framebuffer.
 
+## QEMU Usage
+```
+export K=/path/to/kernel
+mkdir -p out/q
+python3 tools/mkadt.py out/q/qemu.adt --qemu
+python3 tools/mkpayload.py $K out/q/qemu.adt out/q/payload.bin --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress'
+python3 tools/qemu-a135f.py out/q/payload.bin out/q/run --secs 40 --kernel $K
+```
+
 ## How to boot it
 
 **Use uniLoader, the way you boot Linux/postmarketOS today.** uniLoader embeds `blob/Image`, `blob/dtb` and `blob/ramdisk`
