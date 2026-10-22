@@ -13,3 +13,5 @@ out/
 *.ipsw
 kernel.development.*
 kernel.*
+*out/
+*/*/out/
