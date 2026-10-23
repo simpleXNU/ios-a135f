@@ -43,24 +43,24 @@ cp out/ramdisk.bin out/uniloader-blobs/ramdisk
 echo "uniLoader blobs: out/uniloader-blobs/{Image,ramdisk} (use your mainline A13 DTB as blob/dtb)"
 
 # Optional: a stand-alone Android boot.img (only if mkbootimg exists), for bootloaders that load boot.img directly.
-ref=${2:-}
-if command -v mkbootimg >/dev/null 2>&1; then
-	if [ -n "$ref" ]; then
-		rm -rf out/ref && mkdir out/ref
-		args=$(python3 "$(command -v unpack_bootimg.py || echo unpack_bootimg.py)" --boot_img "$ref" --out out/ref --format=mkbootimg)
-		args=$(echo "$args" | sed -E 's#--kernel [^ ]+##; s#--ramdisk [^ ]+##')
-		eval mkbootimg $args --kernel out/Image --ramdisk out/ramdisk.bin -o out/a135f-boot.img
-	else
-		: "${BOOT_HEADER:=2}" "${BOOT_BASE:=0x10000000}" "${BOOT_KERNEL_OFFSET:=0x8000}" \
-		  "${BOOT_RAMDISK_OFFSET:=0x1000000}" "${BOOT_TAGS_OFFSET:=0x100}" "${BOOT_PAGESIZE:=2048}"
-		mkbootimg --header_version "$BOOT_HEADER" --kernel out/Image --ramdisk out/ramdisk.bin \
-			--base "$BOOT_BASE" --kernel_offset "$BOOT_KERNEL_OFFSET" \
-			--ramdisk_offset "$BOOT_RAMDISK_OFFSET" --tags_offset "$BOOT_TAGS_OFFSET" \
-			--pagesize "$BOOT_PAGESIZE" --cmdline "console=null" -o out/a135f-boot.img
-	fi
-	cp out/a135f-boot.img out/boot.img
-	(cd out && tar -H ustar -c boot.img > AP_a135f.tar && md5sum -t AP_a135f.tar >> AP_a135f.tar && mv AP_a135f.tar AP_a135f.tar.md5)
-fi
+#ref=${2:-}
+#if command -v mkbootimg >/dev/null 2>&1; then
+#	if [ -n "$ref" ]; then
+#		rm -rf out/ref && mkdir out/ref
+#		args=$(python3 "$(command -v unpack_bootimg.py || echo unpack_bootimg.py)" --boot_img "$ref" --out out/ref --format=mkbootimg)
+#		args=$(echo "$args" | sed -E 's#--kernel [^ ]+##; s#--ramdisk [^ ]+##')
+#		eval mkbootimg $args --kernel out/Image --ramdisk out/ramdisk.bin -o out/a135f-boot.img
+#	else
+#		: "${BOOT_HEADER:=2}" "${BOOT_BASE:=0x10000000}" "${BOOT_KERNEL_OFFSET:=0x8000}" \
+#		  "${BOOT_RAMDISK_OFFSET:=0x1000000}" "${BOOT_TAGS_OFFSET:=0x100}" "${BOOT_PAGESIZE:=2048}"
+#		mkbootimg --header_version "$BOOT_HEADER" --kernel out/Image --ramdisk out/ramdisk.bin \
+#			--base "$BOOT_BASE" --kernel_offset "$BOOT_KERNEL_OFFSET" \
+#			--ramdisk_offset "$BOOT_RAMDISK_OFFSET" --tags_offset "$BOOT_TAGS_OFFSET" \
+#			--pagesize "$BOOT_PAGESIZE" --cmdline "console=null" -o out/a135f-boot.img
+#	fi
+#	cp out/a135f-boot.img out/boot.img
+#	(cd out && tar -H ustar -c boot.img > AP_a135f.tar && md5sum -t AP_a135f.tar >> AP_a135f.tar && mv AP_a135f.tar AP_a135f.tar.md5)
+#fi
 
 # Host render of the console layout.
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
