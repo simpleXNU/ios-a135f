@@ -1,0 +1,155 @@
+diff --git a/iokit/Kernel/arm/A135FCPU.cpp b/iokit/Kernel/arm/A135FCPU.cpp
+index d1de116..0e15001 100644
+--- a/iokit/Kernel/arm/A135FCPU.cpp
++++ b/iokit/Kernel/arm/A135FCPU.cpp
+@@ -37,45 +37,84 @@ static uint32_t a135f_cpus_registered;
+ #define A135F_TRAMP_PA 0xc8200000ULL
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-static const uint32_t a135f_tramp_code[18] = {
+-	0x58000242, 0xd2995005, 0x9b050802, 0x529fe003, 0x72bfffe3, 0xd2821c08, 0x52800106, 0xaa0203e7,
+-	0x52804004, 0xb80044e3, 0x71000484, 0x54ffffc1, 0x8b080042, 0x710004c6, 0x54ffff21, 0xd5033f9f,
+-	0x58000081, 0xd61f0020,
++#define A135F_TRAMP_WORDS 30
++#define A135F_TRAMP_LIT    (A135F_TRAMP_WORDS * 4)  /* three .quad literals: framebuffer, entry, mailbox PA */
++#define A135F_TRAMP_MBOX   0x400                    /* mailbox page offset: 32 bytes per CPU */
++
++/*
++ * Stub run by a secondary core at the PSCI entry (MMU off, whatever EL the firmware picked):
++ *   mailbox[cpu] = { 0xa135f000 | cpu, CurrentEL, MPIDR_EL1 }; yellow bar; branch to the real entry.
++ */
++static const uint32_t a135f_tramp_code[A135F_TRAMP_WORDS] = {
++	0x58000449, 0x8b001529, 0xd29e000a, 0xf2b426aa, 0xaa00014a, 0xd538424b, 0xd53800ac, 0xf900012a,
++	0xf900052b, 0xf900092c, 0xd5033f9f, 0x58000262, 0xd2995005, 0x9b050802, 0x529fe003, 0x72bfffe3,
++	0xd2821c08, 0x52800106, 0xaa0203e7, 0x52804004, 0xb80044e3, 0x71000484, 0x54ffffc1, 0x8b080042,
++	0x710004c6, 0x54ffff21, 0xd5033f9f, 0x580000a1, 0xd61f0020, 0xd503201f,
+ };
+ 
++static vm_offset_t a135f_tramp_va;
++
+ static uint64_t
+ a135f_build_trampoline(uint64_t entry)
+ {
+-	static vm_offset_t va;
+-	if (!va) {
+-		va = ml_io_map((vm_offset_t)A135F_TRAMP_PA, 0x1000);
++	if (!a135f_tramp_va) {
++		a135f_tramp_va = ml_io_map((vm_offset_t)A135F_TRAMP_PA, 0x1000);
+ 	}
+-	if (!va) {
++	if (!a135f_tramp_va) {
+ 		return 0;
+ 	}
+-	volatile uint32_t *code = (volatile uint32_t *)va;
+-	for (unsigned i = 0; i < 18; i++) {
++	volatile uint32_t *code = (volatile uint32_t *)a135f_tramp_va;
++	for (unsigned i = 0; i < A135F_TRAMP_WORDS; i++) {
+ 		code[i] = a135f_tramp_code[i];
+ 	}
+-	volatile uint64_t *lit = (volatile uint64_t *)(va + 72);
+-	lit[0] = 0xfa000000ULL + 2000ULL * 4320ULL;     /* marker base: the A13 framebuffer */
++	volatile uint64_t *lit = (volatile uint64_t *)(a135f_tramp_va + A135F_TRAMP_LIT);
++	lit[0] = 0xfa000000ULL + 2000ULL * 4320ULL;     /* bar base: the A13 framebuffer */
+ 	lit[1] = entry;
++	lit[2] = A135F_TRAMP_PA + A135F_TRAMP_MBOX;
++	volatile uint64_t *mb = (volatile uint64_t *)(a135f_tramp_va + A135F_TRAMP_MBOX);
++	for (unsigned i = 0; i < 8 * 4; i++) {
++		mb[i] = 0;
++	}
+ 	__builtin_arm_dsb(DSB_SY);
+ 	return A135F_TRAMP_PA;
+ }
+ 
++static void
++a135f_dump_mailbox(unsigned cpu)
++{
++	if (!a135f_tramp_va || cpu >= 8) {
++		return;
++	}
++	volatile uint64_t *mb = (volatile uint64_t *)(a135f_tramp_va + A135F_TRAMP_MBOX) + cpu * 4;
++	IOLog("A135F CPU: cpu=%u trampoline mailbox: magic=0x%llx CurrentEL=0x%llx MPIDR=0x%llx\n",
++	    cpu, (uint64_t)mb[0], (uint64_t)mb[1], (uint64_t)mb[2]);
++}
++
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+-static int32_t
+-a135f_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
++static int64_t
++a135f_psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+ {
+-	register uint64_t x0 __asm__("x0") = 0xC4000003ULL;
+-	register uint64_t x1 __asm__("x1") = target;
+-	register uint64_t x2 __asm__("x2") = entry;
+-	register uint64_t x3 __asm__("x3") = context;
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
+ 	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+ 	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+ 	    "x14", "x15", "x16", "x17", "cc", "memory");
+-	return (int32_t)x0;
++	return (int64_t)x0;
++}
++
++static int32_t
++a135f_psci_cpu_on(uint64_t fn, uint64_t target, uint64_t entry, uint64_t context)
++{
++	return (int32_t)a135f_psci_call(fn, target, entry, context);
++}
++
++/* AFFINITY_INFO(target, level 0): 0 = ON, 1 = OFF, 2 = ON_PENDING, negative = error */
++static int64_t
++a135f_psci_affinity(uint64_t target)
++{
++	return a135f_psci_call(0xC4000004ULL, target, 0, 0);
+ }
+ 
+ class A135FCPU : public IOCPU {
+@@ -198,8 +237,9 @@ A135FCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !a135f_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("A135F CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
++				IOLog("A135F CPU: cpu=%u mpidr=0x%x NOT alive after 5s, AFFINITY_INFO = %lld\n",
++				    i, topology->cpus[i].phys_id, (long long)a135f_psci_affinity(topology->cpus[i].phys_id));
++				a135f_dump_mailbox(i);
+ 				panic("A135F CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+@@ -292,8 +332,32 @@ A135FCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 			IOLog("A135F CPU: cpu=%u trampoline at 0x%llx -> 0x%llx\n", getCPUNumber(), t, (uint64_t)entry);
+ 		}
+ 	}
+-	int32_t rc = a135f_psci_cpu_on(cpu->phys_id, psci_entry, getCPUNumber());
+-	IOLog("A135F CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++	/*
++	 * Experiments for firmware that accepts CPU_ON but never runs the core:
++	 *   a135f_mpidr_or=N  OR N into the target MPIDR (e.g. 0x80000000 for the RES1 bit)
++	 *   a135f_psci32=1    use the SMC32 CPU_ON function id and a 32-bit entry (trampoline only)
++	 */
++	uint64_t target = cpu->phys_id;
++	uint64_t fn = 0xC4000003ULL;
++	int mpidr_or = 0, psci32 = 0;
++	if (PE_parse_boot_argn("a135f_mpidr_or", &mpidr_or, sizeof(mpidr_or))) {
++		target |= (uint32_t)mpidr_or;
++	}
++	if (PE_parse_boot_argn("a135f_psci32", &psci32, sizeof(psci32)) && psci32 && psci_entry < 0x100000000ULL) {
++		fn = 0x84000003ULL;
++	}
++	static bool psci_probed;
++	if (!psci_probed) {
++		psci_probed = true;
++		IOLog("A135F CPU: PSCI version=0x%llx FEATURES(CPU_ON64)=0x%llx FEATURES(AFFINITY_INFO64)=0x%llx\n",
++		    (uint64_t)a135f_psci_call(0x84000000ULL, 0, 0, 0),
++		    (uint64_t)a135f_psci_call(0x8400000AULL, 0xC4000003ULL, 0, 0),
++		    (uint64_t)a135f_psci_call(0x8400000AULL, 0xC4000004ULL, 0, 0));
++	}
++	IOLog("A135F CPU: cpu=%u AFFINITY_INFO before = %lld\n", getCPUNumber(), (long long)a135f_psci_affinity(target));
++	int32_t rc = a135f_psci_cpu_on(fn, target, psci_entry, getCPUNumber());
++	IOLog("A135F CPU: cpu=%u PSCI fn=0x%llx target=0x%llx CPU_ON rc=%d, AFFINITY_INFO after = %lld\n", getCPUNumber(),
++	    fn, target, rc, (long long)a135f_psci_affinity(target));
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+ 		panic("A135F CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
