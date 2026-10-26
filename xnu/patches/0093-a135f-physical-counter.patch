@@ -1,0 +1,30 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index bc3218e..5fb6ad6 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2107,7 +2107,12 @@ ml_set_decrementer(uint32_t dec_value)
+ static inline uint64_t
+ nonspeculative_timebase(void)
+ {
+-#if defined(HAS_ACNTVCT)
++#if defined(A135F)
++	/* The Samsung firmware leaves a different CNTVOFF on each core, so CNTVCT_EL0 differs between CPUs;
++	 * the physical counter is common to all of them. (The timer still uses CNTV_TVAL: relative.) */
++	__builtin_arm_isb(ISB_SY);
++	return __builtin_arm_rsr64("CNTPCT_EL0");
++#elif defined(HAS_ACNTVCT)
+ 	return __builtin_arm_rsr64("ACNTVCT_EL0");
+ #elif __ARM_ARCH_8_6__
+ 	return __builtin_arm_rsr64("CNTVCTSS_EL0");
+@@ -2188,8 +2193,11 @@ ml_get_speculative_timebase(void)
+ 	do {
+ 		timebase = getCpuDatap()->cpu_base_timebase;
+ 		os_compiler_barrier();
++#if defined(A135F)
++		clock = __builtin_arm_rsr64("CNTPCT_EL0");     /* common to all cores, see nonspeculative_timebase() */
++#else
+ 		clock = __builtin_arm_rsr64("CNTVCT_EL0");
+-
++#endif
+ 		os_compiler_barrier();
+ 	} while (getCpuDatap()->cpu_base_timebase != timebase);
