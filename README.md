@@ -36,27 +36,21 @@
 
 1. **Kernel:** fork the repo and run the `xnu` workflow (`gh workflow run xnu.yml -R YOU/ios-a135f`), then
    `gh run download RUN_ID -n kernel-development-a135f -D xnu/out`. Expect compile errors on the first runs (`keep_going` collects them all).
-3. **Root image:** as upstream: `tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G`, then
-   `tools/a135f-root-tweaks.py`. Needs the iPhone X (iPhone10,3) 16.7.16 IPSW from Apple.
-for the latest ios 16.7.16 ipsw (iphone x) off ipsw.me:
+2. 
 ```
 tools/ios-create-root-full.sh <url_to_ipsw or path/to/ipsw>
 ```
 
 
 # Todo: REWRITE
-4. **Payload and blobs:**
+1. **Payload and blobs:**
    ```sh
    python3 tools/mkadt.py shim/out/a135f.adt --touch-fw /path/to/td4375_a13_boe.bin   # vendor TCM image you load on Linux
    python3 tools/mkpayload.py xnu/out/kernel.development.a135f shim/out/a135f.adt shim/out/payload.bin \
        --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=mmcroot0 mmcrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 a135f_fb_noconsole=1 a135f_fb_hz=30'
-   shim/build.sh shim/out/payload.bin      # needs aarch64-linux-gnu-gcc/binutils; -> shim/out/uniloader-blobs/{Image,ramdisk}
+   shim/build.sh out/payload.bin      # needs aarch64-linux-gnu-gcc/binutils; -> shim/out/uniloader-blobs/{Image,ramdisk}
    ```
-5. **uniLoader:** copy `shim/out/uniloader-blobs/Image` to `uniLoader/blob/Image`, `.../ramdisk` to `blob/ramdisk`, and your usual mainline A13 DTB to
-   `blob/dtb`; build uniLoader exactly as for Linux (same board config, `PAYLOAD_ENTRY`/`RAMDISK_ENTRY` as for your Linux build) and flash the
-   result to `boot`. Write the iOS root image to `userdata`. (If you have `mkbootimg`, `shim/build.sh payload.bin [ref-boot.img]` also writes a
-   stand-alone `a135f-boot.img` and an Odin `AP_a135f.tar.md5`.)
-6. **Logs:** the kernel keeps a 4 MiB console ring at the end of `userdata`; read it from recovery/pmOS with
+2. **Logs:** the kernel keeps a 4 MiB console ring at the end of `userdata`; read it from recovery/pmOS with
    `tools/a135f-log-pull.sh`. The shim also paints a status/panic screen on the framebuffer.
 
 ## QEMU Usage
