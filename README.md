@@ -1,6 +1,6 @@
 # ios-a135f
 
-**iOS 16 on a Samsung Galaxy A13 (SM-A135F) **
+**iOS 16 on a Samsung Galaxy A13 (SM-A135F)**
 
 ## Hardware status
 
@@ -12,7 +12,7 @@
 | RAM | 2 GiB block at `0x880000000` | Working (todo: 3gb/4gb) |
 | Display | Simple framebuffer, 1080x2408 at `0xfa000000` | Working |
 | Storage | Exynos DWMMC driver; root `rd=mmcroot0` | Working |
-| Boot | SBOOT / uniLoader; shim flashed to `boot`, including EL2-to-EL1 transition; preferably via Fastboot | Working |
+| Boot | SBOOT / uniLoader; shim flashed to `boot`, including EL2-to-EL1 transition; preferrably via Fastboot | Working |
 | Keys | Volume up/down on GPIO `gpa0-7` / `gpa1-0`, both pressed together is power | Working |
 | power key | power button on PMIC interrupts | not implemented |
 | Fuelgauge | Maxim Max1726x | Not implemented |
