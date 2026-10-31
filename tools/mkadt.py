@@ -3,7 +3,7 @@
 
 Target: Samsung Galaxy A13 (SM-A135F), Exynos850. Only what the early boot
 path actually reads; every MMIO address comes from the mainline
-exynos850.dtsi / A13 device tree. Usage:  mkadt.py OUT.adt [--dump] [--qemu]
+exynos850.dtsi / A13 device tree. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--ram 3gb|4gb] [--touch-fw FILE]
 """
 import hashlib, os, struct, sys
 
@@ -14,7 +14,24 @@ import adt  # noqa: E402
 # memory node). The low banks (0x80000000.., 0xc0000000.., 0xe0d00000..) are
 # left alone: the shim and the eMMC DMA window (0xc8000000, see /a135f-mmc) use them.
 PHYS_BASE = 0x880000000
-MEM_SIZE = 0x80000000
+# RAM variants (last <reg> entry of the memory node in the board dts):
+#   3gb: exynos850-a135f-3gb.dts  <0x8 0x80000000 0x0 0x40000000>  -> 1 GiB
+#   4gb: exynos850-a135f-4gb.dts  <0x8 0x80000000 0x0 0x80000000>  -> 2 GiB
+RAM_VARIANTS = {'3gb': 0x40000000, '4gb': 0x80000000}
+RAM_DEFAULT = '3gb'
+
+
+def ram_variant():
+    """--ram 3gb|4gb or $A135F_RAM (default 3gb)."""
+    v = os.environ.get('A135F_RAM', RAM_DEFAULT)
+    if '--ram' in sys.argv:
+        v = sys.argv[sys.argv.index('--ram') + 1]
+    if v not in RAM_VARIANTS:
+        sys.exit('--ram must be one of: ' + ', '.join(RAM_VARIANTS))
+    return v
+
+
+MEM_SIZE = RAM_VARIANTS[ram_variant()]
 # --qemu keeps a small low-memory layout for QEMU virt (tools/qemu-a135f.py)
 QEMU_PHYS_BASE = 0xb0000000
 QEMU_MEM_SIZE = 0x40000000   # ends at 0xf0000000, below the framebuffer at 0xfa000000
@@ -285,4 +302,4 @@ if __name__ == '__main__':
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    print(f'{sys.argv[1]}: {len(blob)} bytes, RAM {ram_variant()} (0x{PHYS_BASE:x} + 0x{MEM_SIZE:x})', file=sys.stderr)
