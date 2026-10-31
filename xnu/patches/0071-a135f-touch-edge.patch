@@ -29,7 +29,7 @@
  	}
 +	if (!was && down) {
 +		fEdge[finger] = x < A135F_TOUCH_EDGE_PX || x > 1079 - A135F_TOUCH_EDGE_PX ||
-+		    y < A135F_TOUCH_EDGE_PX || y > 2399 - A135F_TOUCH_EDGE_PX;
++		    y < A135F_TOUCH_EDGE_PX || y > 2407 - A135F_TOUCH_EDGE_PX;
 +	}
  
  	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
