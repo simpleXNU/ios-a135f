@@ -1,0 +1,662 @@
+diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+index f0c8a72..237bc82 100644
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -19,6 +19,51 @@ include $(MakeInc_def)
+ CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
+ SFLAGS+= -include meta_features.h
+ 
++ifeq ($(CURRENT_MACHINE_CONFIG),A135F)
++A135F_AES_ROOT = $(SRCROOT)/libkern/crypto/a135f_bearssl
++A135F_AES_INC = -I$(A135F_AES_ROOT)/inc -I$(A135F_AES_ROOT)/src
++a135f_aes.o_INCFLAGS = $(A135F_AES_INC)
++a135f_aes_ct.o_INCFLAGS = $(A135F_AES_INC)
++a135f_aes_ct_enc.o_INCFLAGS = $(A135F_AES_INC)
++a135f_aes_ct_dec.o_INCFLAGS = $(A135F_AES_INC)
++a135f_aes_ct_cbcenc.o_INCFLAGS = $(A135F_AES_INC)
++a135f_aes_ct_cbcdec.o_INCFLAGS = $(A135F_AES_INC)
++a135f_aes.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_aes_ct.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_aes_ct_enc.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_aes_ct_dec.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_aes_ct_cbcenc.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_aes_ct_cbcdec.o_CFLAGS_ADD += -mgeneral-regs-only
++corecrypto_aes.o_CFLAGS_ADD += -mgeneral-regs-only
++# BearSSL MD5 behind the legacy MD5Init/Update/Final API (corecrypto_md5.c).
++a135f_md5.o_INCFLAGS = $(A135F_AES_INC)
++a135f_dec32le.o_INCFLAGS = $(A135F_AES_INC)
++a135f_enc32le.o_INCFLAGS = $(A135F_AES_INC)
++corecrypto_md5.o_INCFLAGS = $(A135F_AES_INC)
++a135f_md5.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_dec32le.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_enc32le.o_CFLAGS_ADD += -mgeneral-regs-only
++corecrypto_md5.o_CFLAGS_ADD += -mgeneral-regs-only
++# BearSSL SHA-1 behind the legacy SHA1Init/Update/Final API (corecrypto_sha1.c).
++a135f_sha1.o_INCFLAGS = $(A135F_AES_INC)
++a135f_dec32be.o_INCFLAGS = $(A135F_AES_INC)
++a135f_enc32be.o_INCFLAGS = $(A135F_AES_INC)
++corecrypto_sha1.o_INCFLAGS = $(A135F_AES_INC)
++a135f_sha1.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_dec32be.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_enc32be.o_CFLAGS_ADD += -mgeneral-regs-only
++corecrypto_sha1.o_CFLAGS_ADD += -mgeneral-regs-only
++# BearSSL SHA-384/512 for SHA384_*/SHA512_* (corecrypto_sha2.c).
++a135f_sha2big.o_INCFLAGS = $(A135F_AES_INC)
++a135f_dec64be.o_INCFLAGS = $(A135F_AES_INC)
++a135f_enc64be.o_INCFLAGS = $(A135F_AES_INC)
++corecrypto_sha2.o_INCFLAGS = $(A135F_AES_INC)
++a135f_sha2big.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_dec64be.o_CFLAGS_ADD += -mgeneral-regs-only
++a135f_enc64be.o_CFLAGS_ADD += -mgeneral-regs-only
++corecrypto_sha2.o_CFLAGS_ADD += -mgeneral-regs-only
++endif
++
+ # Runtime support functions don't interact well with LTO (9294679)
+ stack_protector.o_CFLAGS_ADD += $(CFLAGS_NOLTO_FLAG)
+ 
+diff --git a/libkern/conf/files b/libkern/conf/files
+index ece14c7..61b1dc8 100644
+--- a/libkern/conf/files
++++ b/libkern/conf/files
+@@ -97,6 +97,21 @@ libkern/crypto/corecrypto_sha1.c		optional crypto
+ libkern/crypto/corecrypto_md5.c			optional crypto
+ libkern/crypto/corecrypto_des.c			optional crypto
+ libkern/crypto/corecrypto_aes.c			optional crypto
++libkern/crypto/a135f_aes.c	optional crypto
++libkern/crypto/a135f_aes_ct.c	optional crypto
++libkern/crypto/a135f_aes_ct_enc.c	optional crypto
++libkern/crypto/a135f_aes_ct_dec.c	optional crypto
++libkern/crypto/a135f_aes_ct_cbcenc.c	optional crypto
++libkern/crypto/a135f_aes_ct_cbcdec.c	optional crypto
++libkern/crypto/a135f_md5.c	optional crypto
++libkern/crypto/a135f_dec32le.c	optional crypto
++libkern/crypto/a135f_enc32le.c	optional crypto
++libkern/crypto/a135f_sha1.c	optional crypto
++libkern/crypto/a135f_dec32be.c	optional crypto
++libkern/crypto/a135f_enc32be.c	optional crypto
++libkern/crypto/a135f_sha2big.c	optional crypto
++libkern/crypto/a135f_dec64be.c	optional crypto
++libkern/crypto/a135f_enc64be.c	optional crypto
+ libkern/crypto/corecrypto_aesxts.c		optional crypto
+ libkern/crypto/corecrypto_rand.c		optional crypto
+ libkern/crypto/corecrypto_rsa.c		    optional crypto
+diff --git a/libkern/crypto/a135f_aes.c b/libkern/crypto/a135f_aes.c
+new file mode 100644
+index 0000000..8628a2a
+--- /dev/null
++++ b/libkern/crypto/a135f_aes.c
+@@ -0,0 +1,111 @@
++/*
++ * A135F legacy AES CBC/ECB provider backed by BearSSL's portable bitslice AES.
++ * Upstream sources and MIT license are staged by 0020-stage-bearssl.sh.
++ * No heap, SIMD or CPU crypto extension is needed. Contexts can be copied:
++ * their only pointer is the immutable BearSSL class descriptor.
++ */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include <libkern/libkern.h>
++#include <libkern/crypto/aes.h>
++#include <corecrypto/ccmode.h>
++#include <corecrypto/cc_error.h>
++#include "a135f_bearssl/inc/bearssl_block.h"
++
++_Static_assert(sizeof(br_aes_ct_cbcenc_keys) <= sizeof(aes_encrypt_ctx),
++    "BearSSL encryption context does not fit the XNU AES ABI");
++_Static_assert(sizeof(br_aes_ct_cbcdec_keys) <= sizeof(aes_decrypt_ctx),
++    "BearSSL decryption context does not fit the XNU AES ABI");
++
++static int
++a135f_aes_encrypt_init(const struct ccmode_cbc *mode, cccbc_ctx *ctx,
++    size_t key_len, const void *key)
++{
++    (void)mode;
++    if (ctx == NULL) {
++        return CCERR_PARAMETER;
++    }
++    cc_clear(sizeof(br_aes_ct_cbcenc_keys), ctx);
++    if (key == NULL || (key_len != 16 && key_len != 24 && key_len != 32)) {
++        return CCERR_PARAMETER;
++    }
++    br_aes_ct_cbcenc_init((br_aes_ct_cbcenc_keys *)(void *)ctx, key, key_len);
++    return CCERR_OK;
++}
++
++static int
++a135f_aes_decrypt_init(const struct ccmode_cbc *mode, cccbc_ctx *ctx,
++    size_t key_len, const void *key)
++{
++    (void)mode;
++    if (ctx == NULL) {
++        return CCERR_PARAMETER;
++    }
++    cc_clear(sizeof(br_aes_ct_cbcdec_keys), ctx);
++    if (key == NULL || (key_len != 16 && key_len != 24 && key_len != 32)) {
++        return CCERR_PARAMETER;
++    }
++    br_aes_ct_cbcdec_init((br_aes_ct_cbcdec_keys *)(void *)ctx, key, key_len);
++    return CCERR_OK;
++}
++
++static int
++a135f_aes_check(const void *ctx, const void *iv, size_t nblocks,
++    const void *in, void *out, unsigned rounds)
++{
++    if (ctx == NULL || iv == NULL ||
++        (rounds != 10 && rounds != 12 && rounds != 14)) {
++        return CCERR_PARAMETER;
++    }
++    if (nblocks > SIZE_MAX / 16) {
++        return CCERR_OVERFLOW;
++    }
++    if (nblocks != 0 && (in == NULL || out == NULL)) {
++        return CCERR_PARAMETER;
++    }
++    return CCERR_OK;
++}
++
++static int
++a135f_aes_encrypt_cbc(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks,
++    const void *in, void *out)
++{
++    const br_aes_ct_cbcenc_keys *key = (const void *)ctx;
++    int error = a135f_aes_check(ctx, iv, nblocks, in, out,
++        key == NULL ? 0 : key->num_rounds);
++    if (error != CCERR_OK || nblocks == 0) {
++        return error;
++    }
++    /* BearSSL is in-place; copy first so both corecrypto API forms work. */
++    memmove(out, in, nblocks * 16);
++    br_aes_ct_cbcenc_run(key, iv, out, nblocks * 16);
++    return CCERR_OK;
++}
++
++static int
++a135f_aes_decrypt_cbc(const cccbc_ctx *ctx, cccbc_iv *iv, size_t nblocks,
++    const void *in, void *out)
++{
++    const br_aes_ct_cbcdec_keys *key = (const void *)ctx;
++    int error = a135f_aes_check(ctx, iv, nblocks, in, out,
++        key == NULL ? 0 : key->num_rounds);
++    if (error != CCERR_OK || nblocks == 0) {
++        return error;
++    }
++    memmove(out, in, nblocks * 16);
++    br_aes_ct_cbcdec_run(key, iv, out, nblocks * 16);
++    return CCERR_OK;
++}
++
++const struct ccmode_cbc a135f_aes_cbc_encrypt = {
++    .size = sizeof(br_aes_ct_cbcenc_keys),
++    .block_size = 16,
++    .init = a135f_aes_encrypt_init,
++    .cbc = a135f_aes_encrypt_cbc,
++};
++const struct ccmode_cbc a135f_aes_cbc_decrypt = {
++    .size = sizeof(br_aes_ct_cbcdec_keys),
++    .block_size = 16,
++    .init = a135f_aes_decrypt_init,
++    .cbc = a135f_aes_decrypt_cbc,
++};
++#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/libkern/crypto/a135f_aes_ct.c b/libkern/crypto/a135f_aes_ct.c
+new file mode 100644
+index 0000000..6a7401c
+--- /dev/null
++++ b/libkern/crypto/a135f_aes_ct.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/symcipher/aes_ct.c"
++#endif
+diff --git a/libkern/crypto/a135f_aes_ct_cbcdec.c b/libkern/crypto/a135f_aes_ct_cbcdec.c
+new file mode 100644
+index 0000000..61de766
+--- /dev/null
++++ b/libkern/crypto/a135f_aes_ct_cbcdec.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/symcipher/aes_ct_cbcdec.c"
++#endif
+diff --git a/libkern/crypto/a135f_aes_ct_cbcenc.c b/libkern/crypto/a135f_aes_ct_cbcenc.c
+new file mode 100644
+index 0000000..300916b
+--- /dev/null
++++ b/libkern/crypto/a135f_aes_ct_cbcenc.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/symcipher/aes_ct_cbcenc.c"
++#endif
+diff --git a/libkern/crypto/a135f_aes_ct_dec.c b/libkern/crypto/a135f_aes_ct_dec.c
+new file mode 100644
+index 0000000..934e74b
+--- /dev/null
++++ b/libkern/crypto/a135f_aes_ct_dec.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/symcipher/aes_ct_dec.c"
++#endif
+diff --git a/libkern/crypto/a135f_aes_ct_enc.c b/libkern/crypto/a135f_aes_ct_enc.c
+new file mode 100644
+index 0000000..ed89b24
+--- /dev/null
++++ b/libkern/crypto/a135f_aes_ct_enc.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/symcipher/aes_ct_enc.c"
++#endif
+diff --git a/libkern/crypto/a135f_dec32be.c b/libkern/crypto/a135f_dec32be.c
+new file mode 100644
+index 0000000..1bb3755
+--- /dev/null
++++ b/libkern/crypto/a135f_dec32be.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/codec/dec32be.c"
++#endif
+diff --git a/libkern/crypto/a135f_dec32le.c b/libkern/crypto/a135f_dec32le.c
+new file mode 100644
+index 0000000..682999f
+--- /dev/null
++++ b/libkern/crypto/a135f_dec32le.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/codec/dec32le.c"
++#endif
+diff --git a/libkern/crypto/a135f_dec64be.c b/libkern/crypto/a135f_dec64be.c
+new file mode 100644
+index 0000000..b85599d
+--- /dev/null
++++ b/libkern/crypto/a135f_dec64be.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/codec/dec64be.c"
++#endif
+diff --git a/libkern/crypto/a135f_enc32be.c b/libkern/crypto/a135f_enc32be.c
+new file mode 100644
+index 0000000..4c6555e
+--- /dev/null
++++ b/libkern/crypto/a135f_enc32be.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/codec/enc32be.c"
++#endif
+diff --git a/libkern/crypto/a135f_enc32le.c b/libkern/crypto/a135f_enc32le.c
+new file mode 100644
+index 0000000..8d45dac
+--- /dev/null
++++ b/libkern/crypto/a135f_enc32le.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/codec/enc32le.c"
++#endif
+diff --git a/libkern/crypto/a135f_enc64be.c b/libkern/crypto/a135f_enc64be.c
+new file mode 100644
+index 0000000..9f31a89
+--- /dev/null
++++ b/libkern/crypto/a135f_enc64be.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/codec/enc64be.c"
++#endif
+diff --git a/libkern/crypto/a135f_md5.c b/libkern/crypto/a135f_md5.c
+new file mode 100644
+index 0000000..4db49ea
+--- /dev/null
++++ b/libkern/crypto/a135f_md5.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/hash/md5.c"
++#endif
+diff --git a/libkern/crypto/a135f_sha1.c b/libkern/crypto/a135f_sha1.c
+new file mode 100644
+index 0000000..7af3ed0
+--- /dev/null
++++ b/libkern/crypto/a135f_sha1.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/hash/sha1.c"
++#endif
+diff --git a/libkern/crypto/a135f_sha2big.c b/libkern/crypto/a135f_sha2big.c
+new file mode 100644
+index 0000000..9805962
+--- /dev/null
++++ b/libkern/crypto/a135f_sha2big.c
+@@ -0,0 +1,4 @@
++/* BearSSL sources are fetched at an immutable commit by 0020-stage-bearssl.sh. */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/src/hash/sha2big.c"
++#endif
+diff --git a/libkern/crypto/corecrypto_aes.c b/libkern/crypto/corecrypto_aes.c
+index 20ff4f1..6e22691 100644
+--- a/libkern/crypto/corecrypto_aes.c
++++ b/libkern/crypto/corecrypto_aes.c
+@@ -32,10 +32,21 @@
+ #include <corecrypto/ccaes.h>
+ #include <kern/debug.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++/* A135F has a built-in portable AES provider for the legacy CBC/ECB API. */
++extern const struct ccmode_cbc a135f_aes_cbc_encrypt;
++extern const struct ccmode_cbc a135f_aes_cbc_decrypt;
++#define AES_CBC_ENCRYPT_MODE (&a135f_aes_cbc_encrypt)
++#define AES_CBC_DECRYPT_MODE (&a135f_aes_cbc_decrypt)
++#else
++#define AES_CBC_ENCRYPT_MODE (g_crypto_funcs->ccaes_cbc_encrypt)
++#define AES_CBC_DECRYPT_MODE (g_crypto_funcs->ccaes_cbc_decrypt)
++#endif
++
+ aes_rval
+ aes_encrypt_key(const unsigned char *key, int key_len, aes_encrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
++	const struct ccmode_cbc *cbc = AES_CBC_ENCRYPT_MODE;
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+ 	if (cbc->size > sizeof(aes_encrypt_ctx)) {
+@@ -49,7 +60,7 @@ aes_rval
+ aes_encrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
+     unsigned char *out_blk, aes_encrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_encrypt;
++	const struct ccmode_cbc *cbc = AES_CBC_ENCRYPT_MODE;
+ 	cccbc_iv_decl(cbc->block_size, ctx_iv);
+ 
+ 	int rc = cccbc_set_iv(cbc, ctx_iv, in_iv);
+@@ -72,7 +83,7 @@ aes_encrypt(const unsigned char *in_blk, unsigned char *out_blk, aes_encrypt_ctx
+ aes_rval
+ aes_decrypt_key(const unsigned char *key, int key_len, aes_decrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
++	const struct ccmode_cbc *cbc = AES_CBC_DECRYPT_MODE;
+ 
+ 	/* Make sure the context size for the mode fits in the one we have */
+ 	if (cbc->size > sizeof(aes_decrypt_ctx)) {
+@@ -86,7 +97,7 @@ aes_rval
+ aes_decrypt_cbc(const unsigned char *in_blk, const unsigned char *in_iv, unsigned int num_blk,
+     unsigned char *out_blk, aes_decrypt_ctx cx[1])
+ {
+-	const struct ccmode_cbc *cbc = g_crypto_funcs->ccaes_cbc_decrypt;
++	const struct ccmode_cbc *cbc = AES_CBC_DECRYPT_MODE;
+ 	cccbc_iv_decl(cbc->block_size, ctx_iv);
+ 
+ 	int rc = cccbc_set_iv(cbc, ctx_iv, in_iv);
+diff --git a/libkern/crypto/corecrypto_md5.c b/libkern/crypto/corecrypto_md5.c
+index 242dcdb..78ba389 100644
+--- a/libkern/crypto/corecrypto_md5.c
++++ b/libkern/crypto/corecrypto_md5.c
+@@ -17,6 +17,62 @@ setCount(MD5_CTX *ctx, uint64_t count)
+ }
+ 
+ /* Copy a ccdigest ctx into a legacy MD5 context */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++/*
++ * A135F has no corecrypto kext (g_crypto_funcs stays NULL). MD5 uses
++ * BearSSL's portable implementation (libkern/crypto/a135f_md5.c), with
++ * MD5_CTX carrying exactly its state: chaining value, byte count and the
++ * partial block, converted around each call like the corecrypto path does.
++ */
++#include "a135f_bearssl/inc/bearssl_hash.h"
++
++static void
++MD5ToBr(MD5_CTX *md5_ctx, br_md5_context *br_ctx)
++{
++	br_md5_init(br_ctx);
++	memcpy(br_ctx->val, md5_ctx->state, sizeof(br_ctx->val));
++	br_ctx->count = getCount(md5_ctx);
++	memcpy(br_ctx->buf, md5_ctx->buffer, sizeof(br_ctx->buf));
++}
++
++static void
++BrToMD5(const br_md5_context *br_ctx, MD5_CTX *md5_ctx)
++{
++	memcpy(md5_ctx->state, br_ctx->val, sizeof(md5_ctx->state));
++	setCount(md5_ctx, br_ctx->count);
++	memcpy(md5_ctx->buffer, br_ctx->buf, sizeof(md5_ctx->buffer));
++}
++
++void
++MD5Init(MD5_CTX *ctx)
++{
++	br_md5_context br_ctx;
++
++	br_md5_init(&br_ctx);
++	BrToMD5(&br_ctx, ctx);
++}
++
++void
++MD5Update(MD5_CTX *ctx, const void *data, unsigned int len)
++{
++	br_md5_context br_ctx;
++
++	MD5ToBr(ctx, &br_ctx);
++	br_md5_update(&br_ctx, data, len);
++	BrToMD5(&br_ctx, ctx);
++}
++
++void
++MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
++{
++	br_md5_context br_ctx;
++
++	MD5ToBr(ctx, &br_ctx);
++	br_md5_out(&br_ctx, digest);
++}
++
++#else /* !ARM64_BOARD_CONFIG_A135F */
++
+ static void
+ DiToMD5(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, MD5_CTX *md5_ctx)
+ {
+@@ -68,3 +124,5 @@ MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
+ 	MD5ToDi(di, ctx, di_ctx);
+ 	ccdigest_final(di, di_ctx, digest);
+ }
++
++#endif /* !ARM64_BOARD_CONFIG_A135F */
+diff --git a/libkern/crypto/corecrypto_sha1.c b/libkern/crypto/corecrypto_sha1.c
+index 5fd982b..534d5eb 100644
+--- a/libkern/crypto/corecrypto_sha1.c
++++ b/libkern/crypto/corecrypto_sha1.c
+@@ -16,6 +16,62 @@ setCount(SHA1_CTX *ctx, uint64_t count)
+ 	ctx->c.b64[0] = count;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++/*
++ * A135F has no corecrypto kext (g_crypto_funcs stays NULL). SHA-1 uses
++ * BearSSL's portable implementation (libkern/crypto/a135f_sha1.c), with
++ * SHA1_CTX carrying exactly its state: chaining value, byte count and the
++ * partial block, converted around each call like the corecrypto path does.
++ */
++#include "a135f_bearssl/inc/bearssl_hash.h"
++
++static void
++SHA1ToBr(SHA1_CTX *sha1_ctx, br_sha1_context *br_ctx)
++{
++	br_sha1_init(br_ctx);
++	memcpy(br_ctx->val, sha1_ctx->h.b32, sizeof(br_ctx->val));
++	br_ctx->count = getCount(sha1_ctx);
++	memcpy(br_ctx->buf, sha1_ctx->m.b8, sizeof(br_ctx->buf));
++}
++
++static void
++BrToSHA1(const br_sha1_context *br_ctx, SHA1_CTX *sha1_ctx)
++{
++	memcpy(sha1_ctx->h.b32, br_ctx->val, sizeof(sha1_ctx->h.b32));
++	setCount(sha1_ctx, br_ctx->count);
++	memcpy(sha1_ctx->m.b8, br_ctx->buf, sizeof(sha1_ctx->m.b8));
++}
++
++void
++SHA1Init(SHA1_CTX *ctx)
++{
++	br_sha1_context br_ctx;
++
++	br_sha1_init(&br_ctx);
++	BrToSHA1(&br_ctx, ctx);
++}
++
++void
++SHA1Update(SHA1_CTX *ctx, const void *data, size_t len)
++{
++	br_sha1_context br_ctx;
++
++	SHA1ToBr(ctx, &br_ctx);
++	br_sha1_update(&br_ctx, data, len);
++	BrToSHA1(&br_ctx, ctx);
++}
++
++void
++SHA1Final(void *digest, SHA1_CTX *ctx)
++{
++	br_sha1_context br_ctx;
++
++	SHA1ToBr(ctx, &br_ctx);
++	br_sha1_out(&br_ctx, digest);
++}
++
++#else /* !ARM64_BOARD_CONFIG_A135F */
++
+ /* Copy a ccdigest ctx into a legacy SHA1 context */
+ static void
+ DiToSHA1(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, SHA1_CTX *sha1_ctx)
+@@ -69,6 +125,8 @@ SHA1Final(void *digest, SHA1_CTX *ctx)
+ 	ccdigest_final(di, di_ctx, digest);
+ }
+ 
++#endif /* !ARM64_BOARD_CONFIG_A135F */
++
+ /* This is not publicised in header, but exported in libkern.exports */
+ void SHA1Final_r(SHA1_CTX *context, void *digest);
+ void
+diff --git a/libkern/crypto/corecrypto_sha2.c b/libkern/crypto/corecrypto_sha2.c
+index 7392f0c..d6a80ec 100644
+--- a/libkern/crypto/corecrypto_sha2.c
++++ b/libkern/crypto/corecrypto_sha2.c
+@@ -34,38 +34,101 @@
+ 
+ #if defined(CRYPTO_SHA2)
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++/*
++ * A135F has no corecrypto kext, so g_crypto_funcs stays NULL. SHA-256 uses
++ * XNU's built-in implementation directly, as the A135F PRNG does; this also
++ * serves code-signing page hashes. SHA-384/512 use BearSSL's portable
++ * implementation (libkern/crypto/a135f_sha2big.c), its context stored in
++ * the caller's SHA384_CTX/SHA512_CTX.
++ */
++#include <corecrypto/ccsha2.h>
++#define SHA256_DI()                     (&ccsha256_ltc_di)
++#define SHA256_INIT(di, ctx)            ccdigest_init(di, ctx)
++#define SHA256_UPDATE(di, ctx, len, d)  ccdigest_update(di, ctx, len, d)
++#else
++#define SHA256_DI()                     (g_crypto_funcs->ccsha256_di)
++#define SHA256_INIT(di, ctx)            g_crypto_funcs->ccdigest_init_fn(di, ctx)
++#define SHA256_UPDATE(di, ctx, len, d)  g_crypto_funcs->ccdigest_update_fn(di, ctx, len, d)
++#endif
++
+ void
+ SHA256_Init(SHA256_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = SHA256_DI();
+ 
+ 	/* Make sure the context size for the digest info fits in the one we have */
+ 	if (ccdigest_di_size(di) > sizeof(SHA256_CTX)) {
+ 		panic("%s: inconsistent size for SHA256 context", __FUNCTION__);
+ 	}
+ 
+-	g_crypto_funcs->ccdigest_init_fn(di, ctx->ctx);
++	SHA256_INIT(di, ctx->ctx);
+ }
+ 
+ void
+ SHA256_Update(SHA256_CTX *ctx, const void *data, size_t len)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = SHA256_DI();
+ 
+-	g_crypto_funcs->ccdigest_update_fn(di, ctx->ctx, len, data);
++	SHA256_UPDATE(di, ctx->ctx, len, data);
+ }
+ 
+ void
+ SHA256_Final(void *digest, SHA256_CTX *ctx)
+ {
+ 	const struct ccdigest_info *di;
+-	di = g_crypto_funcs->ccsha256_di;
++	di = SHA256_DI();
+ 
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include "a135f_bearssl/inc/bearssl_hash.h"
++
++_Static_assert(sizeof(br_sha384_context) <= sizeof(SHA512_CTX),
++    "BearSSL SHA-384/512 context must fit in SHA512_CTX");
++#define BR_CTX(ctx) ((br_sha384_context *)(void *)(ctx))
++
++void
++SHA384_Init(SHA384_CTX *ctx)
++{
++	br_sha384_init(BR_CTX(ctx));
++}
++
++void
++SHA384_Update(SHA384_CTX *ctx, const void *data, size_t len)
++{
++	br_sha384_update(BR_CTX(ctx), data, len);
++}
++
++void
++SHA384_Final(void *digest, SHA384_CTX *ctx)
++{
++	br_sha384_out(BR_CTX(ctx), digest);
++}
++
++void
++SHA512_Init(SHA512_CTX *ctx)
++{
++	br_sha512_init(BR_CTX(ctx));
++}
++
++void
++SHA512_Update(SHA512_CTX *ctx, const void *data, size_t len)
++{
++	br_sha512_update(BR_CTX(ctx), data, len);
++}
++
++void
++SHA512_Final(void *digest, SHA512_CTX *ctx)
++{
++	br_sha512_out(BR_CTX(ctx), digest);
++}
++
++#else /* !ARM64_BOARD_CONFIG_A135F */
++
+ void
+ SHA384_Init(SHA384_CTX *ctx)
+ {
+@@ -131,6 +194,8 @@ SHA512_Final(void *digest, SHA512_CTX *ctx)
+ 	ccdigest_final(di, ctx->ctx, digest);
+ }
+ 
++#endif /* !ARM64_BOARD_CONFIG_A135F */
++
+ #else
+ 
+ /* As these are part of the KPI, we need to stub them out for any kernel configuration that does not support SHA2. */

@@ -1,0 +1,1742 @@
+diff --git a/bsd/dev/a135f_keys.c b/bsd/dev/a135f_keys.c
+index 008c369..f1782a0 100644
+--- a/bsd/dev/a135f_keys.c
++++ b/bsd/dev/a135f_keys.c
+@@ -1,8 +1,14 @@
+ /*
+- * Minimal polled A135F keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * Polled hardware keys for the Galaxy A13 (Exynos850).
++ *
++ * Volume up is gpa0-7 and volume down is gpa1-0 on the ALIVE pin controller
++ * (0x11850000), both active low. The power key is wired to the S2MPU12 PMIC
++ * (ACPM), which has no driver here yet, so pressing both volume keys together
++ * is reported as Power (lock/wake) and suppresses the two volume events.
++ *
++ * The pins are only read; the function mux is switched from EINT to plain
++ * input so the DAT register reflects the pad. Call once after the scheduler
++ * is running.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ #include <sys/param.h>
+@@ -17,68 +23,44 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void a135f_hid_key(int key, int down);
+ void a135f_keys_init(void);
+ 
+-#define KEYS_CORE_PA     0x0c440000u
+-#define KEYS_OBS_PA      0x0e600000u
+-#define KEYS_CNFG_PA     0x0c40a000u
+-#define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
+-#define KEYS_NO_APID     0xffffu
++#define ALIVE_PA        0x11850000u
++#define GPA0            0x000u          /* bank: CON +0 (4 bits/pin), DAT +4 */
++#define GPA1            0x020u
++#define VOLUP_PIN       7               /* gpa0-7 */
++#define VOLDN_PIN       0               /* gpa1-0 */
++/* key indices understood by a135f_hid_key(): 0 power, 1 volume up, 2 volume down */
++#define KEY_POWER       0
++#define KEY_VOLUP       1
++#define KEY_VOLDN       2
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg;
+-static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+-static uint32_t keys_version, keys_last_status;
++static vm_offset_t keys_base;
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
+ static uint32_t
+-keys_rd(vm_offset_t base, uint32_t off)
++keys_rd(uint32_t off)
+ {
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
++	return *(volatile uint32_t *)(keys_base + off);
+ }
+ 
+-/* v5 can map one PPID more than once; prefer the apps-owned entry. */
+-static uint16_t
+-keys_find_apid(uint16_t ppid, uint32_t count)
++static void
++keys_wr(uint32_t off, uint32_t v)
+ {
+-	uint16_t found = KEYS_NO_APID;
+-	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
+-		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
+-		}
+-		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
+-		if (found == KEYS_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
+-		}
+-	}
+-	return found;
++	*(volatile uint32_t *)(keys_base + off) = v;
++}
++
++static void
++keys_make_input(uint32_t bank, unsigned pin)
++{
++	uint32_t con = keys_rd(bank);
++	con &= ~(0xfu << (pin * 4));    /* function 0 = input */
++	keys_wr(bank, con);
+ }
+ 
+ static bool
+-keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
++keys_down(uint32_t bank, unsigned pin)
+ {
+-	if (apid == KEYS_NO_APID) {
+-		return false;
+-	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+-	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		keys_last_status = keys_rd(keys_obs, off + 0x08u);
+-		if (keys_last_status & 1u) {
+-			if (keys_last_status & 0x0eu) {
+-				return false;
+-			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
++	return !((keys_rd(bank + 4) >> pin) & 1u);      /* active low */
+ }
+ 
+ static void
+@@ -93,29 +75,39 @@ keys_wait(void)
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int state[3] = {0, 0, 0};
+-	unsigned errors = 0;
++	bool up_sent = false, dn_sent = false, chord = false;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0, gpio = 0;
+-		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
+-			if ((errors++ % 250u) == 0) {
+-				printf("A135F KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+-				    pok, gok, keys_last_status);
++		bool up = keys_down(GPA0, VOLUP_PIN), dn = keys_down(GPA1, VOLDN_PIN);
++		if (up && dn) {
++			if (!chord) {
++				chord = true;
++				if (up_sent) {
++					a135f_hid_key(KEY_VOLUP, 0);
++					up_sent = false;
++				}
++				if (dn_sent) {
++					a135f_hid_key(KEY_VOLDN, 0);
++					dn_sent = false;
++				}
++				printf("A135F KEYS: volume up+down chord -> power down\n");
++				a135f_hid_key(KEY_POWER, 1);
++			}
++		} else if (chord) {
++			if (!up && !dn) {
++				chord = false;
++				printf("A135F KEYS: chord released -> power up\n");
++				a135f_hid_key(KEY_POWER, 0);
+ 			}
+ 		} else {
+-			errors = 0;
+-		}
+-		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+-				state[k] = now[k];
+-				printf("A135F KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+-				    k, state[k], pon, gpio);
+-				a135f_hid_key(k, state[k]);
++			if (up != up_sent) {
++				up_sent = up;
++				a135f_hid_key(KEY_VOLUP, up);
++			}
++			if (dn != dn_sent) {
++				dn_sent = dn;
++				a135f_hid_key(KEY_VOLDN, dn);
+ 			}
+ 		}
+ 		keys_wait();
+@@ -136,42 +128,14 @@ a135f_keys_init(void)
+ 		printf("A135F KEYS: disabled (a135f_keys=0)\n");
+ 		return;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
++	keys_base = ml_io_map(ALIVE_PA, 0x1000);
++	if (!keys_base) {
+ 		printf("A135F KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+-	keys_version = keys_rd(keys_core, 0);
+-	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+-	    count == 0 || count > 512) {
+-		printf("A135F KEYS: unsupported arbiter version=%#x apids=%u\n",
+-		    keys_version, count);
+-		return;
+-	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+-	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("A135F KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("A135F KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+-		keys_gpio_apid = KEYS_NO_APID;
+-	}
+-	if (!pok && !gok) {
+-		printf("A135F KEYS: no readable keys; polling retained for recovery\n");
+-	}
++	keys_make_input(GPA0, VOLUP_PIN);
++	keys_make_input(GPA1, VOLDN_PIN);
++	printf("A135F KEYS: gpa0 dat 0x%x gpa1 dat 0x%x\n", keys_rd(GPA0 + 4), keys_rd(GPA1 + 4));
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/bsd/dev/a135f_rpmh.c b/bsd/dev/a135f_rpmh.c
+deleted file mode 100644
+index 647a67c..0000000
+--- a/bsd/dev/a135f_rpmh.c
++++ /dev/null
+@@ -1,358 +0,0 @@
+-/*
+- * A135F PM6150L L11C bring-up; see report.md for DT and source evidence.
+- * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+- * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
+- */
+-#if defined(ARM64_BOARD_CONFIG_A135F)
+-#include <sys/param.h>
+-#include <sys/systm.h>
+-#include <sys/errno.h>
+-#include <kern/clock.h>
+-#include <machine/machine_routines.h>
+-
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-int a135f_rpmh_vreg_enable(const char *res, unsigned mv);
+-
+-/* Live downstream DT has two positional reg entries, no reg-names. */
+-#define RH_RSC_PA       0x18220000u
+-#define RH_TCS_PA       0x18220d00u
+-#define RH_TCS_SIZE     0x3000u
+-#define RH_DICT_PA      0x0c3f000cu
+-#define RH_DRV          2u
+-#define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
+-#define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+-#define RH_TCS_STRIDE   0x2a0u
+-#define RH_CMD_STRIDE   0x14u
+-#define RH_IRQ_EN       0x00u
+-#define RH_IRQ_STATUS   0x04u
+-#define RH_IRQ_CLEAR    0x08u
+-#define RH_WAIT         0x10u
+-#define RH_CONTROL      0x14u
+-#define RH_STATUS       0x18u
+-#define RH_ENABLE       0x1cu
+-#define RH_MSGID        0x30u
+-#define RH_ADDR         0x34u
+-#define RH_DATA         0x38u
+-#define RH_CMD_STATUS   0x3cu
+-#define RH_AMC_EN       (1u << 16)
+-#define RH_TRIGGER      (1u << 24)
+-#define RH_ISSUED       (1u << 8)
+-#define RH_COMPLETE     (1u << 16)
+-#define RH_WRITE_ACK    (8u | (1u << 8) | (1u << 16))
+-#define RH_DB_MAGIC     0x0c0330dbu
+-#define RH_DB_HEADER    144u
+-#define RH_DB_ENTRY     24u
+-#define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+-#define RH_VRM          4u
+-#define RH_TIMEOUT_US   100000u
+-
+-static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+-static uint32_t rh_db_size;
+-static unsigned rh_ncpt;
+-static unsigned rh_lock;
+-static bool rh_poisoned;
+-
+-static uint32_t
+-rh_read(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
+-}
+-
+-static void
+-rh_write(vm_offset_t base, uint32_t off, uint32_t value)
+-{
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = value;
+-	__asm__ volatile("dsb osh" ::: "memory");
+-}
+-
+-static bool
+-rh_sync(uint32_t off, uint32_t value)
+-{
+-	rh_write(rh_tcs, off, value);
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		if (rh_read(rh_tcs, off) == value) {
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	printf("A135F RPMH: readback timeout off=%#x want=%#x got=%#x\n",
+-	    off, value, rh_read(rh_tcs, off));
+-	return false;
+-}
+-
+-/* DB is little endian; avoid packed structs and unaligned Device loads. */
+-static uint16_t
+-rh_db16(uint32_t off)
+-{
+-	uint32_t v = rh_read(rh_db, off & ~3u);
+-	return (uint16_t)(v >> (8u * (off & 3u)));
+-}
+-
+-static bool
+-rh_range(uint32_t off, uint32_t size)
+-{
+-	return off <= rh_db_size && size <= rh_db_size - off;
+-}
+-
+-static int
+-rh_map(void)
+-{
+-	if (!rh_rsc) {
+-		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
+-	}
+-	if (!rh_tcs) {
+-		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
+-	}
+-	if (!rh_dict) {
+-		rh_dict = ml_io_map(RH_DICT_PA, 8);
+-	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
+-		printf("A135F RPMH: RSC/locator mapping failed\n");
+-		return ENOMEM;
+-	}
+-	uint32_t id = rh_read(rh_rsc, 0);
+-	uint32_t solver = rh_read(rh_rsc, 4);
+-	uint32_t config = rh_read(rh_rsc, 0x0c);
+-	unsigned major = (id >> 16) & 0xffu;
+-	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+-	rh_ncpt = (config >> 27) & 0x1fu;
+-	printf("A135F RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+-	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
+-	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+-	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+-	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+-	    count > RH_TCS_SIZE / RH_TCS_STRIDE || rh_ncpt < 3 || rh_ncpt > 16) {
+-		printf("A135F RPMH: unsupported RSC geometry/revision\n");
+-		return ENODEV;
+-	}
+-	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("A135F RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
+-		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+-		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+-		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+-		    (uint64_t)pa + size > 0x100000000ULL) {
+-			printf("A135F RPMH: invalid cmd-db locator\n");
+-			return EINVAL;
+-		}
+-		rh_db = ml_io_map(pa, size);
+-		if (!rh_db) {
+-			return ENOMEM;
+-		}
+-		rh_db_size = size;
+-	}
+-	uint32_t db_version = rh_read(rh_db, 0);
+-	uint32_t magic = rh_read(rh_db, 4);
+-	uint32_t flags = rh_read(rh_db, 140);
+-	printf("A135F RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
+-	    db_version, magic, rh_read(rh_db, 136), flags);
+-	/* Linux only checks magic; version 1 is an intentionally stricter policy. */
+-	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+-		printf("A135F RPMH: unsupported/standalone cmd-db\n");
+-		return EINVAL;
+-	}
+-	return 0;
+-}
+-
+-static int
+-rh_lookup(const char *res, uint32_t *address)
+-{
+-	uint32_t key[2] = {0, 0};
+-	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+-		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
+-	}
+-	unsigned matches = 0;
+-	for (unsigned i = 0; i < 8; ++i) {
+-		uint32_t h = 8u + 16u * i;
+-		unsigned slave = rh_db16(h);
+-		if (!slave) {
+-			break;
+-		}
+-		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+-		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
+-		unsigned count = rh_db16(h + 6);
+-		if (slave < 3 || slave > 5 || (entries & 3u) ||
+-		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
+-			printf("A135F RPMH: malformed cmd-db slave header %u\n", i);
+-			return EINVAL;
+-		}
+-		for (unsigned j = 0; j < count; ++j) {
+-			uint32_t e = entries + RH_DB_ENTRY * j;
+-			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
+-				continue;
+-			}
+-			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+-			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("A135F RPMH: invalid VRM entry for %s\n", res);
+-				return EINVAL;
+-			}
+-			*address = addr;
+-			++matches;
+-			printf("A135F RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+-			    res, addr, slave, rh_db16(h + 8),
+-			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+-		}
+-	}
+-	if (matches != 1) {
+-		printf("A135F RPMH: %s lookup matches=%u; refusing\n", res, matches);
+-		return ENODEV;
+-	}
+-	return 0;
+-}
+-
+-static bool
+-rh_free(unsigned t)
+-{
+-	uint32_t b = t * RH_TCS_STRIDE;
+-	/* Idle alone is insufficient: a sleep/wake payload can be armed and idle. */
+-	return rh_read(rh_tcs, b + RH_STATUS) != 0 &&
+-	    rh_read(rh_tcs, b + RH_STATUS) != 0xffffffffu &&
+-	    rh_read(rh_tcs, b + RH_CONTROL) == 0 &&
+-	    rh_read(rh_tcs, b + RH_ENABLE) == 0 &&
+-	    rh_read(rh_tcs, b + RH_WAIT) == 0 &&
+-	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+-}
+-
+-static int
+-rh_send(uint32_t address, unsigned mv)
+-{
+-	int chosen = -1;
+-	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+-		uint32_t b = t * RH_TCS_STRIDE;
+-		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+-		printf("A135F RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
+-		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
+-		    enabled, rh_read(rh_tcs, b + RH_WAIT));
+-		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+-			return EIO;
+-		}
+-		for (unsigned c = 0; c < rh_ncpt; ++c) {
+-			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("A135F RPMH: conflicting inherited L11C request in TCS%u\n", t);
+-				return EBUSY;
+-			}
+-		}
+-		if (chosen < 0 && rh_free(t)) {
+-			chosen = (int)t;
+-		}
+-	}
+-	if (chosen < 0) {
+-		printf("A135F RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
+-		return EBUSY;
+-	}
+-	unsigned t = (unsigned)chosen;
+-	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
+-	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
+-	if (irq_en == 0xffffffffu || !rh_free(t)) {
+-		return EBUSY;
+-	}
+-	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
+-	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
+-		rh_poisoned = true;
+-		return EIO;
+-	}
+-	if (!rh_free(t)) {
+-		/* No payload was touched. Do not acknowledge somebody else's IRQ. */
+-		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
+-			rh_poisoned = true;
+-		}
+-		return EBUSY;
+-	}
+-	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+-	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("A135F RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
+-		uint32_t cmd = b + c * RH_CMD_STRIDE;
+-		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+-		    !rh_sync(cmd + RH_DATA, values[c])) {
+-			return EIO;
+-		}
+-	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
+-	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+-		return EIO;
+-	}
+-	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
+-	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
+-	bool done = false, progress = false;
+-	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
+-		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+-		idle = rh_read(rh_tcs, b + RH_STATUS);
+-		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
+-			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+-			complete &= status[c] != 0xffffffffu &&
+-			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+-		}
+-		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
+-		progress |= idle == 0 || !complete;
+-		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
+-		    ((irq & bit) || progress) && complete) {
+-			done = true;
+-			break;
+-		}
+-		delay(1);
+-	}
+-	printf("A135F RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
+-	if (!done) {
+-		printf("A135F RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+-		return ETIMEDOUT;
+-	}
+-	/* Proven completion: clear trigger before mode, then free only our commands. */
+-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
+-	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+-		return EIO;
+-	}
+-	rh_write(rh_tcs, RH_IRQ_CLEAR, bit); /* W1C: never clear other TCS bits */
+-	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
+-	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
+-		return EIO;
+-	}
+-	rh_poisoned = false;
+-	printf("A135F RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
+-	return 0;
+-}
+-
+-int
+-a135f_rpmh_vreg_enable(const char *res, unsigned mv)
+-{
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("A135F RPMH: expected ldoc11 and 2950..3400 mV\n");
+-		return EINVAL;
+-	}
+-	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+-		return EBUSY;
+-	}
+-	int error = EIO;
+-	uint32_t address = 0;
+-	if (rh_poisoned) {
+-		printf("A135F RPMH: previous uncertain transaction; refusing further access\n");
+-		goto out;
+-	}
+-	error = rh_map();
+-	if (!error) {
+-		error = rh_lookup(res, &address);
+-	}
+-	if (!error) {
+-		error = rh_send(address, mv);
+-	}
+-out:
+-	if (error) {
+-		printf("A135F RPMH: enable failed errno=%d\n", error);
+-	}
+-	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+-	return error;
+-}
+-#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/bsd/dev/a135f_spmi.c b/bsd/dev/a135f_spmi.c
+deleted file mode 100644
+index 0a91c25..0000000
+--- a/bsd/dev/a135f_spmi.c
++++ /dev/null
+@@ -1,126 +0,0 @@
+-/*
+- * Battery-only adaptation of input/a135f_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in A135FBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+- */
+-#if defined(ARM64_BOARD_CONFIG_A135F)
+-#include <sys/param.h>
+-#include <sys/systm.h>
+-#include <machine/machine_routines.h>
+-#include <IOKit/IOLocks.h>
+-#include "a135f_spmi.h"
+-
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
+-#define SP_NO_APID 0xffffu
+-
+-static vm_offset_t sp_core, sp_obs, sp_cfg;
+-static IOLock *sp_lock;
+-static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
+-/* A timed-out command may complete late: never reuse that lane this boot. */
+-static bool sp_poisoned[512];
+-
+-static uint32_t
+-sp_rd(vm_offset_t base, unsigned off)
+-{
+-	uint32_t value = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return value;
+-}
+-
+-static uint16_t
+-sp_find_apid(unsigned ppid)
+-{
+-	uint16_t found = SP_NO_APID;
+-	for (unsigned i = 0; i < sp_count; ++i) {
+-		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
+-		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
+-		}
+-		unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * i) & 7u;
+-		if (found == SP_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
+-		}
+-	}
+-	return found;
+-}
+-
+-int
+-a135f_spmi_init(void)
+-{
+-	if (sp_attempted) {
+-		return sp_ready ? 0 : -1;
+-	}
+-	sp_attempted = true;
+-	sp_lock = IOLockAlloc();
+-	if (!sp_lock) {
+-		return -1;
+-	}
+-	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+-	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+-	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+-	if (!sp_core || !sp_cfg || !sp_obs) {
+-		printf("A135F BATTERY: SPMI mapping failed\n");
+-		return -1;
+-	}
+-	uint32_t arb_version = sp_rd(sp_core, 0);
+-	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+-	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
+-	    !sp_count || sp_count > 512) {
+-		printf("A135F BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+-		    arb_version, sp_count);
+-		return -1;
+-	}
+-	sp_ready = true;
+-	printf("A135F BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
+-	return 0;
+-}
+-
+-int
+-a135f_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+-{
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
+-	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
+-		return -1;
+-	}
+-	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+-	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
+-		return -1;
+-	}
+-	unsigned off = 0x80u * apid;
+-	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+-		if (status & 1u) {
+-			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
+-				return -1;
+-			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
+-			return 0;
+-		}
+-		delay(1);
+-	}
+-	sp_poisoned[apid] = true;
+-	printf("A135F BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+-	    sid, addr, apid);
+-	IOLockUnlock(sp_lock);
+-	return -1;
+-}
+-#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/bsd/dev/a135f_spmi.h b/bsd/dev/a135f_spmi.h
+deleted file mode 100644
+index ecd74fd..0000000
+--- a/bsd/dev/a135f_spmi.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/* Shared C/C++ interface. Init once, on the A135FBattery start thread. */
+-#ifndef A135F_BATTERY_SPMI_H
+-#define A135F_BATTERY_SPMI_H
+-#include <stdint.h>
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-int a135f_spmi_init(void);
+-/* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+-int a135f_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+-#ifdef __cplusplus
+-}
+-#endif
+-#endif
+diff --git a/bsd/dev/a135f_usb.c b/bsd/dev/a135f_usb.c
+index 200768b..2a1d5f3 100644
+--- a/bsd/dev/a135f_usb.c
++++ b/bsd/dev/a135f_usb.c
+@@ -1,14 +1,18 @@
+ /*
+- * A135F: USB bring-up, step 1 - read-only state probe.
++ * Galaxy A13 (Exynos850) USB device mode: CDC-ECM networking + live log.
+  *
+- * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+- * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
+- * controller for fastboot; this probe only reports what state it is left
+- * in after `fastboot boot`. It never writes a register, and it touches the
+- * DWC3 / PHY register blocks only when the GCC status registers say their
+- * power domain and clocks are on (an access to a gated block would hang).
++ * Hardware: Synopsys DWC3 (USB 2.0 only, high-speed) at 0x13600000 behind the
++ * Samsung "USBDRD" glue, UTMI PHY at 0x135d0000 (phy-exynos5-usbdrd.c,
++ * exynos850_usbdrd_utmi_init), PHY power isolation in the PMU (0x11860000 +
++ * 0x704), clock gates in CMU_HSI (0x13400000). Nothing guarantees the
++ * bootloader left the PHY running, so this driver
++ *   1. opens the CMU_HSI USB gates (the USER muxes stay as the bootloader set them),
++ *   2. releases the PMU PHY isolation,
++ *   3. runs the UTMI PHY init (26 MHz reference, VBUS-valid forced since no
++ *      Type-C/charger switch driver exists),
++ *   4. only then touches the DWC3 registers (an access to a gated block hangs).
++ * The gadget code below (EP0, CDC-ECM, UDP log stream) is generic DWC3.
++ * boot-arg a135f_usb: 0 off, 1 bring up the PHY and report state, 2 (default) also start the gadget.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ #include <sys/param.h>
+@@ -42,28 +46,54 @@ void a135f_usb_probe(void);
+ static void a135f_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+-#define GCC_PA                  0x00100000
+-#define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+-#define CBCR_CLK_OFF            (1u << 31)
+-
+-static const struct {
+-	const char *name;
+-	uint32_t    off;
+-} usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++
++#define CMU_HSI_PA              0x13400000u
++#define CMU_HSI_SIZE            0x8000u
++#define CMU_GATE_EN             (1u << 21)
++#define PMU_PA                  0x11860000u
++#define PMU_USBDRD_PHY_CONTROL  0x704
++#define PHY_ENABLE              (1u << 0)
++#define USBDRD_PHY_PA           0x135d0000u
++#define USBDRD_PHY_SIZE         0x100u
++#define DWC3_PA                 0x13600000u
++#define DWC3_SIZE               0x10000u
++
++/* CMU_HSI gates, from clk-exynos850.c (bit 21 enables) */
++static const struct { const char *name; uint32_t off; } hsi_usb_gates[] = {
++	{ "usb_rtc", 0x2008 }, { "usb_ref", 0x200c }, { "usb_phy_ref", 0x2010 },
++	{ "usb_phy_aclk", 0x203c }, { "usb_bus_early", 0x2040 },
+ };
+ 
+-#define DWC3_PA                 0x0a600000
+-#define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
++/* EXYNOS850_DRD_* PHY registers */
++#define DRD_LINKCTRL    0x04
++#define   LINKCTRL_FORCE_QACT           (1u << 8)
++#define   LINKCTRL_BUS_FILTER_BYPASS    (0xfu << 4)
++#define DRD_LINKPORT    0x08
++#define   LINKPORT_HOST_NUM_U3          (0xfu << 16)
++#define DRD_CLKRST      0x20
++#define   CLKRST_PHY20_SW_POR           (1u << 13)
++#define   CLKRST_PHY20_SW_POR_SEL       (1u << 12)
++#define   CLKRST_PHY_SW_RST             (1u << 3)
++#define   CLKRST_PHY_RESET_SEL          (1u << 2)
++#define   CLKRST_PORT_RST               (1u << 1)
++#define DRD_SSPPLLCTL   0x30
++#define   SSPPLLCTL_FSEL_MASK           7u
++#define   SSPPLLCTL_FSEL_26MHZ          6u
++#define DRD_UTMI        0x50
++#define   UTMI_FORCE_VBUSVALID          (1u << 5)
++#define   UTMI_FORCE_BVALID             (1u << 4)
++#define   UTMI_DP_PULLDOWN              (1u << 3)
++#define   UTMI_DM_PULLDOWN              (1u << 2)
++#define   UTMI_FORCE_SUSPEND            (1u << 1)
++#define   UTMI_FORCE_SLEEP              (1u << 0)
++#define DRD_HSP         0x54
++#define   HSP_FSV_OUT_EN                (1u << 24)
++#define   HSP_VBUSVLDEXTSEL             (1u << 13)
++#define   HSP_VBUSVLDEXT                (1u << 12)
++#define   HSP_EN_UTMISUSPEND            (1u << 9)
++#define   HSP_COMMONONN                 (1u << 8)
++#define DRD_HSP_TEST    0x5c
++#define   HSP_TEST_SIDDQ                (1u << 24)
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -73,75 +103,95 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* exynos850_usbdrd_utmi_init() with a 26 MHz reference and no Type-C switch */
++static void
++usb_phy_init(vm_offset_t phy)
++{
++	uint32_t reg, ss_ports;
++
++	usb_wr(phy, DRD_LINKCTRL, usb_rd(phy, DRD_LINKCTRL) | LINKCTRL_FORCE_QACT);
++	ss_ports = (usb_rd(phy, DRD_LINKPORT) & LINKPORT_HOST_NUM_U3) >> 16;
++
++	reg = usb_rd(phy, DRD_CLKRST);
++	if (ss_ports) {
++		reg |= CLKRST_PHY20_SW_POR | CLKRST_PHY20_SW_POR_SEL | CLKRST_PHY_RESET_SEL;
++	}
++	usb_wr(phy, DRD_CLKRST, reg | CLKRST_PHY_SW_RST);
++
++	reg = usb_rd(phy, DRD_UTMI);
++	reg &= ~(UTMI_FORCE_SUSPEND | UTMI_FORCE_SLEEP | UTMI_DP_PULLDOWN | UTMI_DM_PULLDOWN);
++	usb_wr(phy, DRD_UTMI, reg);
++	usb_wr(phy, DRD_HSP, usb_rd(phy, DRD_HSP) | HSP_EN_UTMISUSPEND | HSP_COMMONONN);
++	usb_wr(phy, DRD_LINKCTRL, usb_rd(phy, DRD_LINKCTRL) | LINKCTRL_BUS_FILTER_BYPASS);
++
++	/* no Type-C/charger driver: force VBUS valid and B-session valid */
++	usb_wr(phy, DRD_UTMI, usb_rd(phy, DRD_UTMI) | UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID);
++	usb_wr(phy, DRD_HSP, usb_rd(phy, DRD_HSP) | HSP_VBUSVLDEXT | HSP_VBUSVLDEXTSEL);
++
++	reg = usb_rd(phy, DRD_SSPPLLCTL) & ~SSPPLLCTL_FSEL_MASK;
++	usb_wr(phy, DRD_SSPPLLCTL, reg | SSPPLLCTL_FSEL_26MHZ);
++	usb_wr(phy, DRD_HSP_TEST, usb_rd(phy, DRD_HSP_TEST) & ~HSP_TEST_SIDDQ);
++
++	delay(10);
++	reg = usb_rd(phy, DRD_CLKRST);
++	if (ss_ports) {
++		reg |= CLKRST_PHY20_SW_POR_SEL;
++		reg &= ~CLKRST_PHY20_SW_POR;
++	}
++	reg &= ~(CLKRST_PHY_SW_RST | CLKRST_PORT_RST);
++	usb_wr(phy, DRD_CLKRST, reg);
++	delay(75);
++
++	usb_wr(phy, DRD_HSP, usb_rd(phy, DRD_HSP) & ~HSP_FSV_OUT_EN);
++}
++
+ void
+ a135f_usb_probe(void)
+ {
+-	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+-	bool clocks_on = true;
++	int enabled = 2;
+ 
+-	/* a135f_usb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("a135f_usb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+ 	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+-	if (gcc == 0) {
+-		printf("A135F USB: GCC map failed\n");
+-		return;
+-	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+-	printf("A135F USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("A135F USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+-		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+-	}
+-	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+-	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+-	if (!clocks_on) {
+-		printf("A135F USB: controller unpowered or unclocked; DWC3 not read\n");
+-		return;
+-	}
++	vm_offset_t cmu = ml_io_map(CMU_HSI_PA, CMU_HSI_SIZE);
++	vm_offset_t pmu = ml_io_map(PMU_PA, 0x1000);
++	vm_offset_t phy = ml_io_map(USBDRD_PHY_PA, USBDRD_PHY_SIZE);
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+-	if (dwc == 0) {
+-		printf("A135F USB: DWC3 map failed\n");
++	if (!cmu || !pmu || !phy || !dwc) {
++		printf("A135F USB: MMIO mapping failed\n");
+ 		return;
+ 	}
++	for (unsigned i = 0; i < sizeof(hsi_usb_gates) / sizeof(hsi_usb_gates[0]); i++) {
++		usb_wr(cmu, hsi_usb_gates[i].off, usb_rd(cmu, hsi_usb_gates[i].off) | CMU_GATE_EN);
++	}
++	delay(10);
++	usb_wr(pmu, PMU_USBDRD_PHY_CONTROL, usb_rd(pmu, PMU_USBDRD_PHY_CONTROL) | PHY_ENABLE);
++	usb_phy_init(phy);
++	printf("A135F USB: PHY up (UTMI 0x%08x HSP 0x%08x CLKRST 0x%08x)\n",
++	    usb_rd(phy, DRD_UTMI), usb_rd(phy, DRD_HSP), usb_rd(phy, DRD_CLKRST));
+ 	printf("A135F USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+ 	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+-	printf("A135F USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+-	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
+-	    usb_rd(dwc, 0xc720));
+-	printf("A135F USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+-	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+-	    usb_rd(dwc, 0xc140));
++	printf("A135F USB: DWC3 DCFG 0x%08x DCTL 0x%08x DSTS 0x%08x GHWPARAMS0 0x%08x\n",
++	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc70c), usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+ 		a135f_usb_gadget_start(dwc);
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("A135F USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("A135F USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
+ /*
+  * Step 2: USB device mode with only the default control endpoint, enough
+- * for the host to enumerate the phone (boot-arg a135f_usb=2). ABL leaves
+- * the DWC3 powered, clocked, in device mode and halted, with the PHY set
+- * up, so only the device controller is restarted: soft reset, an event
+- * buffer in our memory, endpoint 0, run. Events are polled from a kernel
+- * thread (no interrupt), like the UFS driver. DMA is not cache coherent
+- * (DT qcom,gsi-disable-io-coherency): buffers are cleaned/invalidated.
++ * for the host to enumerate the phone (boot-arg a135f_usb=2, the
++ * default): soft reset, an event buffer in our memory, endpoint 0, run. Events are polled from a kernel
++ * thread (no interrupt), like the eMMC driver. DMA is not cache coherent
++ * (no dma-coherent in the Exynos850 dtsi): buffers are cleaned/invalidated.
+  * Register layout and the control-transfer state machine follow the
+  * Synopsys DWC3 databook as used by Linux drivers/usb/dwc3 (gadget.c,
+  * ep0.c).
+@@ -161,18 +211,6 @@ a135f_usb_probe(void)
+ #define DEPCMDPAR0(n)   (0xc808 + 0x10 * (n))
+ #define DEPCMD(n)       (0xc80c + 0x10 * (n))
+ 
+-/*
+- * Qualcomm wrapper registers ("QSCRATCH", core base + 0xf8800). The
+- * controller only connects (pull-up on D+) while it sees a valid VBUS
+- * session; Linux dwc3-qcom forces that in software when the charger
+- * reports a cable (dwc3_qcom_vbus_override_enable).
+- */
+-#define QSCRATCH_PA             0x0a6f8800
+-#define QSCRATCH_HS_PHY_CTRL    0x10
+-#define   UTMI_OTG_VBUS_VALID   (1u << 20)
+-#define   SW_SESSVLD_SEL        (1u << 28)
+-#define QSCRATCH_SS_PHY_CTRL    0x30
+-#define   LANE0_PWR_PRESENT     (1u << 24)
+ 
+ #define DCTL_RUN_STOP   (1u << 31)
+ #define DCTL_CSFTRST    (1u << 30)
+@@ -802,7 +840,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 
+ /*
+  * Live console log over USB Ethernet: every 100 ms the new bytes of the
+- * console ring (bsd/dev/a135f_ufs.c) go as UDP datagrams to
++ * console ring (bsd/dev/a135f_mmc.c) go as UDP datagrams to
+  * 192.168.7.1:5140 (on the PC: nc -ukl 5140). Starts with the last 64 KiB
+  * so the boot is included. Nothing here may print (it would feed itself).
+  * Boot-arg a135f_usblog=0 disables it.
+@@ -866,7 +904,7 @@ a135f_usb_gadget_start(vm_offset_t dwc)
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	/* Device controller soft reset (the PHY was brought up by a135f_usb_probe()). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+@@ -878,6 +916,8 @@ a135f_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 
++	/* Device role (GCTL.PRTCAPDIR = 2), as dwc3_set_prtcap(DEVICE) */
++	dwc_wr(GCTL, (dwc_rd(GCTL) & ~(3u << 12)) | (2u << 12));
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+@@ -902,18 +942,6 @@ a135f_usb_gadget_start(vm_offset_t dwc)
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	if (qs != 0) {
+-		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+-		printf("A135F USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+-		    hs, ss, usb_rd(qs, 0x08));
+-		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
+-		*(volatile uint32_t *)(qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("A135F USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
+-		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+-	}
+-
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+diff --git a/iokit/Kernel/arm/A135FBattery.cpp b/iokit/Kernel/arm/A135FBattery.cpp
+index 1832da0..032d51e 100644
+--- a/iokit/Kernel/arm/A135FBattery.cpp
++++ b/iokit/Kernel/arm/A135FBattery.cpp
+@@ -12,9 +12,14 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+-/* bsd/dev/a135f_spmi.c */
+-extern "C" int a135f_spmi_init(void);
+-extern "C" int a135f_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/*
++ * The Galaxy A13's battery sits behind a MAX1726x fuel gauge on I2C and the
++ * S2MPU12 PMIC; neither has a driver here yet. The Qualcomm SPMI readout this
++ * file used is gone: these stubs always fail, so the service publishes the
++ * static 100 % / charging fallback.
++ */
++static inline int a135f_spmi_init(void) { return -1; }
++static inline int a135f_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
+ 
+ class A135FBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(A135FBattery);
+diff --git a/iokit/Kernel/arm/A135FCPU.cpp b/iokit/Kernel/arm/A135FCPU.cpp
+index af5278e..641b82e 100644
+--- a/iokit/Kernel/arm/A135FCPU.cpp
++++ b/iokit/Kernel/arm/A135FCPU.cpp
+@@ -1,7 +1,8 @@
+ /*
+- * A55 SMP bring-up for a135f using XNU's legacy IOCPU interface and PSCI.
+- * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+- * CPU_OFF, suspend and the A76 cores still require separate platform work.
++ * Cortex-A55 SMP bring-up for the Galaxy A13 (Exynos850) using XNU's legacy
++ * IOCPU interface and PSCI. The architected timer and SGI1 already enter
++ * through pe_fiq/sleh_irq; IPIs are sent with the GIC-400 (GICv2) GICD_SGIR.
++ * CPU_OFF and suspend still require separate platform work.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -17,6 +18,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm/protos.h>
+ 
+ extern "C" void a135f_secondary_entry(void);
+ extern "C" boolean_t a135f_cpu_signal_is_enabled(unsigned int cpu);
+@@ -73,8 +75,8 @@ A135FCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/* Exynos850 MPIDR: Aff1 = cluster (0/1), Aff0 = core (0-3): 0x000-0x003, 0x100-0x103 */
++	if ((cpu->phys_id & ~0x103u) != 0 ||
+ 	    topology->num_cpus > A135F_SMP_MAX_CPUS) {
+ 		panic("A135F CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -82,7 +84,7 @@ A135FCPU::start(IOService *provider)
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy("Cortex-A55");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -214,19 +216,20 @@ A135FCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("A135F CPU: invalid SGI target %u", logical);
+ 	}
+-	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+-	uint64_t mpidr = topology->cpus[logical].phys_id;
+-	unsigned int aff0 = mpidr & 0xff;
+-	if (aff0 >= 16) {
+-		panic("A135F CPU: SGI target requires unsupported range selector");
++	/*
++	 * GICv2 SGIs are addressed by CPU interface number, not by MPIDR. Each CPU
++	 * records its own interface bit in pe_init_fiq(); before the target has
++	 * run it, fall back to the identity mapping (CPU interface n = logical
++	 * CPU n, as the Exynos850 device tree wires GIC_CPU_MASK_SIMPLE).
++	 */
++	uint32_t mask = a135f_gic_cpu_target[logical];
++	if (mask == 0) {
++		mask = 1U << logical;
+ 	}
+-	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
+-	    (((mpidr >> 16) & 0xff) << 32) |
+-	    (((mpidr >> 8) & 0xff) << 16) |
+-	    ((uint64_t)A135F_IPI_SGI << 24) | (1ULL << aff0);
++	/* TargetListFilter 0 (use the list), CPUTargetList, SGI INTID */
+ 	__builtin_arm_dsb(DSB_ISHST);
+-	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+-	__builtin_arm_isb(ISB_SY);
++	*(volatile uint32_t *)(a135f_gicd_base + GICD_SGIR) = (mask << 16) | A135F_IPI_SGI;
++	__builtin_arm_dsb(DSB_SY);
+ }
+ 
+ kern_return_t
+diff --git a/iokit/Kernel/arm/A135FFramebuffer.cpp b/iokit/Kernel/arm/A135FFramebuffer.cpp
+index 9a2aff7..7c8ffe0 100644
+--- a/iokit/Kernel/arm/A135FFramebuffer.cpp
++++ b/iokit/Kernel/arm/A135FFramebuffer.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Built-in IOMobileFramebuffer for A135F: the ABL's continuous-splash
+- * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
++ * framebuffer (1080x2408 a8r8g8b8 in RAM, the panel scans it out by
+  * itself) as the main display, driven by CoreAnimation's CPU renderer.
+  *
+  * IOMobileFramebuffer.framework (iOS 16.7) counts /arm-io children with
+@@ -75,7 +75,7 @@ enum {
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * centered 1080x2408 part of it is shown on the 1080x2408 panel.
+  * Boot-arg a135f_fb_native=1 presents the real panel size instead.
+  */
+ #define A135F_FB_LOGICAL_W              1125
+@@ -149,6 +149,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++extern "C" void a135f_decon_kick(void);
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -157,6 +159,13 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	{
++		int kick = 1;
++		PE_parse_boot_argn("a135f_decon_kick", &kick, sizeof(kick));
++		if (kick) {
++			a135f_decon_kick();
++		}
++	}
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+diff --git a/osfmk/arm64/a135f_early.c b/osfmk/arm64/a135f_early.c
+index e8da4d0..5bcd7f2 100644
+--- a/osfmk/arm64/a135f_early.c
++++ b/osfmk/arm64/a135f_early.c
+@@ -11,10 +11,10 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0xfa000000;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
++#define EARLY_HEIGHT 2408u
+ #define EARLY_STRIDE (4320u / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+@@ -140,4 +140,21 @@ a135f_early_disable(void)
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
++
++/*
++ * The A13 panel only shows the framebuffer once DECON's HW/SW trigger control
++ * (DECON_F 0x13060000 + 0x70) is written with 0x1281. The boot shim does it
++ * first; this repeats it from the kernel (boot-arg a135f_decon_kick=0 skips it).
++ */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++void
++a135f_decon_kick(void)
++{
++	vm_offset_t decon = ml_io_map(0x13060000u, 0x1000);
++	if (decon) {
++		*(volatile uint32_t *)(decon + 0x70) = 0x1281;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++}
+ #endif /* A135F */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 94bba40..3217d20 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,7 +1843,7 @@ a135f_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = 0xfa000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 8137556..155647b 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -955,7 +955,7 @@ ml_parse_cpu_topology(void)
+ 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
+ 
+ #if defined(A135F)
+-	/* Opt in to SMP: cpus=N (N <= A135F_SMP_MAX_CPUS; cores 6-7 are the A76s). */
++	/* Opt in to SMP: cpus=N (N <= A135F_SMP_MAX_CPUS, eight Cortex-A55). */
+ 	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
+ 		cpu_boot_arg = 1;
+ 	}
+@@ -1088,9 +1088,10 @@ ml_parse_cpu_topology(void)
+ #endif
+ 
+ #if defined(A135F)
+-		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
++		/* Exynos850: Aff1 is the physical cluster (0/1), not an Apple cluster ID; all
++		 * eight cores are presented to the scheduler as one SMP cluster. */
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
+-		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
++		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->cpu_id);
+ #else
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", MPIDR_CLUSTER_ID(cpu->phys_id));
+ 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", MPIDR_CPU_ID(cpu->phys_id));
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0d62729..7b992dc 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1858,13 +1858,14 @@ sleh_irq(arm_saved_state_t *state)
+ 
+ #if defined(A135F)
+ 	/*
+-	 * a135f: TrustZone owns GIC Group 0, so the timer and IPIs that other
+-	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
++	 * a135f (Exynos850, GIC-400 = GICv2): TrustZone owns GIC Group 0, so the
++	 * timer and IPIs that other ARM64 targets take as FIQs arrive here as
++	 * Group 1 IRQs, acknowledged and ended through the MMIO CPU interface.
+ 	 */
+-	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+-	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++	uint32_t iar = *(volatile uint32_t *)(a135f_gicc_base + GICC_IAR);
++	uint32_t intid = iar & 0x3FF; /* bits [12:10] are the SGI source CPU */
+ 
+-	if (intid >= 1020 && intid <= 1023) {
++	if (intid >= 1020) {
+ 		return; /* spurious */
+ 	}
+ 	if (intid == a135f_vtimer_intid) {
+@@ -1873,12 +1874,12 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		*(volatile uint32_t *)(a135f_gicc_base + GICC_EOIR) = iar;
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+-		__builtin_arm_isb(ISB_SY);
++		*(volatile uint32_t *)(a135f_gicc_base + GICC_EOIR) = iar;
++		__builtin_arm_dsb(DSB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+@@ -1888,8 +1889,9 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		*(volatile uint32_t *)(a135f_gicc_base + GICC_EOIR) = iar;
+ 	}
++	__builtin_arm_dsb(DSB_SY);
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 0095f2e..b1cda04 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,7 @@ LEXT(a135f_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
+-	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+-	mrs		x1, ICC_SRE_EL2
+-	orr		x1, x1, #1
+-	orr		x1, x1, #8
+-	msr		ICC_SRE_EL2, x1
++	/* GIC-400 is GICv2: MMIO CPU interface, no ICC_SRE_EL2 to program. */
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+@@ -515,7 +511,7 @@ LEXT(start_first_cpu)
+ 
+ #if defined(A135F)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (0xfa000000 + 2368 * 4320)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -683,10 +679,11 @@ Lkernelcache_base_found:
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+ 	 * create_bootstrap_mapping would replace the RAM L2 table.
+-	 * A135F uses 16K pages and all bring-up RAM is below 4GB, so the first
++	 * A135F uses 16K pages; the framebuffer (0xfa000000) and the kernel RAM
++	 * (0x880000000, above 4GB) both have L1 index 0 (< 64GB), so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, 0xfa000000
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 0240f57..6b42508 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -267,7 +267,7 @@ _cnputc(char c, bool poll)
+  * @param size The number of characters to print to the console.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+-extern void a135f_log_append(const char *c, int size);  /* bsd/dev/a135f_ufs.c */
++extern void a135f_log_append(const char *c, int size);  /* bsd/dev/a135f_mmc.c */
+ /*
+  * Set by AppleCLCD (boot-arg a135f_fb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 350adc7..f30ff0b 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -3,7 +3,6 @@
+  */
+ 
+ #include <stdint.h>
+-#include <libkern/section_keywords.h>
+ #include <arm64/proc_reg.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
+@@ -17,11 +16,6 @@
+ #define GICR_WAKE_TIMEOUT_NS (1000000000ULL) // timeout for redistributor wakeup (default 1s)
+ MACHINE_TIMEOUT(gicr_wake_timeout_ns, "gicr-wake-timeout", GICR_WAKE_TIMEOUT_NS, MACHINE_TIMEOUT_UNIT_NSEC, NULL);
+ 
+-#if defined(A135F)
+-/* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
+-SECURITY_READ_ONLY_LATE(uint32_t) a135f_vtimer_intid = A135F_VTIMER_INTID;
+-#endif
+-
+ static vm_offset_t gicd_base;
+ static vm_offset_t gicr_base;
+ static vm_offset_t gicr_size;
+@@ -102,23 +96,6 @@ pe_init_fiq()
+ 			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
+ 		}
+ 
+-#if defined(A135F)
+-		/* Read only on the boot CPU, before the GIC and RO-late lockdown. */
+-		void const *timer_prop;
+-		unsigned int timer_size;
+-		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
+-			if (timer_size != sizeof(uint32_t)) {
+-				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
+-			}
+-			uint32_t intid = *(const uint32_t *)timer_prop;
+-			if (intid < 16 || intid >= 32) {
+-				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
+-			}
+-			a135f_vtimer_intid = intid;
+-		}
+-		kprintf("A135F GIC: virtual timer INTID %u\n", a135f_vtimer_intid);
+-#endif
+-
+ 		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
+ 
+ 		uint64_t const gicd_base_prop = ((uint64_t const *) prop)[0];
+@@ -164,25 +141,11 @@ pe_init_fiq()
+ 		}
+ 	}
+ 
+-#if defined(A135F)
+-	/*
+-	 * Real hardware with two security states: Group 0 is TrustZone's and
+-	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+-	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
+-	 * from the non-secure side even after this write; delivery still works.
+-	 */
+-	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
+-	for (unsigned int i = 0; i < 32; i += 4) {
+-		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+-	}
+-	gicr_write32(GICR_ISENABLER0, (1U << a135f_vtimer_intid) | (1U << A135F_IPI_SGI));
+-#else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+ 
+ 	// Enable PPI 27
+ 	gicr_write32(GICR_ISENABLER0, (1 << 27));
+-#endif /* A135F */
+ 
+ 	// Enable system register access
+ 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
+@@ -190,12 +153,8 @@ pe_init_fiq()
+ 	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
+ 	__builtin_arm_isb(ISB_SY);
+ 
+-#if defined(A135F)
+-	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+-#else
+ 	// Set priority masks and binary point for group 0
+ 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
+-#endif /* A135F */
+ 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
+ 
+ 	// Set EOI mode of this processor
+@@ -203,24 +162,133 @@ pe_init_fiq()
+ 	icc_ctlr &= ~ICC_CTLR_EOIMODE;
+ 	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+ 
+-#if defined(A135F)
+-	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
+-	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+-	gicd_ctlr |= GICD_CTLR_ARE_NS | GICD_CTLR_ENABLEGRP1A | GICD_CTLR_ENABLEGRP1;
+-	gicd_write32(GICD_CTLR, gicd_ctlr);
+-	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
+-		;
+-	}
+-	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+-	__builtin_arm_isb(ISB_SY);
+-#else
+ 	// Enable the forwarding of the vtimer interrupt
+ 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
+ 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
+ 	gicd_write32(GICD_CTLR, gicd_ctlr);
+ 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
+ 	__builtin_arm_isb(ISB_SY);
+-#endif /* A135F */
++}
++#elif defined(A135F)
++/*
++ * Samsung Galaxy A13 (Exynos850): ARM GIC-400, a GICv2 with the security
++ * extensions. The non-secure world sees Group 1 only; TrustZone has already
++ * routed the interrupts we use (the PPIs/SGIs and any SPI) to Group 1, which
++ * non-secure code cannot change. Each CPU enables its banked PPI/SGI state
++ * and its own CPU interface; the boot CPU also switches the distributor on.
++ */
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++SECURITY_READ_ONLY_LATE(uint32_t) a135f_vtimer_intid = A135F_VTIMER_INTID;
++SECURITY_READ_ONLY_LATE(vm_offset_t) a135f_gicd_base;
++SECURITY_READ_ONLY_LATE(vm_offset_t) a135f_gicc_base;
++/* GIC CPU interface bit (GICD_SGIR CPUTargetList) of each logical CPU, learned by that CPU. */
++volatile uint8_t a135f_gic_cpu_target[MAX_CPUS];
++
++static inline uint32_t
++gicd_read32(uint32_t off)
++{
++	return *(volatile uint32_t *)(a135f_gicd_base + off);
++}
++
++static inline void
++gicd_write32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a135f_gicd_base + off) = v;
++}
++
++static inline uint32_t
++gicc_read32(uint32_t off)
++{
++	return *(volatile uint32_t *)(a135f_gicc_base + off);
++}
++
++static inline void
++gicc_write32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(a135f_gicc_base + off) = v;
++}
++
++void
++pe_init_fiq()
++{
++	// a135f_gicd_base is 0 only before the boot processor initializes it.
++	// Avoid the (not thread-safe) SecureDT* routines on secondary processors.
++	if (!a135f_gicd_base) {
++		DTEntry entry;
++		void const *prop;
++		unsigned int prop_size;
++
++		if (SecureDTLookupEntry(NULL, "/arm-io/gic", &entry) != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++		if (SecureDTGetProperty(entry, "reg", &prop, &prop_size) != kSuccess) {
++			panic("%s: cannot find GIC MMIO regions in DT", __func__);
++		}
++		// GICD base, GICD size, GICC base, GICC size (relative to the SoC base)
++		if (prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
++		}
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
++			if (timer_size != sizeof(uint32_t)) {
++				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
++			}
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			a135f_vtimer_intid = intid;
++		}
++		kprintf("A135F GIC: virtual timer INTID %u\n", a135f_vtimer_intid);
++
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++		uint64_t const *regs = (uint64_t const *)prop;
++
++		a135f_gicd_base = ml_io_map(soc_base_phys + regs[0], regs[1]);
++		if (!a135f_gicd_base) {
++			panic("%s: cannot map GICD region", __func__);
++		}
++		a135f_gicc_base = ml_io_map(soc_base_phys + regs[2], regs[3]);
++		if (!a135f_gicc_base) {
++			panic("%s: cannot map GICC region", __func__);
++		}
++
++		// Boot CPU: turn the distributor on (the bootloader leaves it as Linux expects to find it).
++		gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++		__builtin_arm_dsb(DSB_SY);
++	}
++
++	// Per-CPU (banked) PPI/SGI state: priority 0xa0 like Linux, enable the
++	// virtual timer PPI and the IPI SGI.
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR0 + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER0, (1U << a135f_vtimer_intid) | (1U << A135F_IPI_SGI));
++
++	// Our CPU interface bit: GICD_ITARGETSR0..7 are read-only and read back
++	// the calling CPU's interface mask in every byte (see Linux gic_get_cpumask()).
++	uint32_t mask = 0;
++	for (unsigned int i = 0; i < 32 && !mask; i += 4) {
++		mask = gicd_read32(GICD_ITARGETSR0 + i);
++		mask |= mask >> 16;
++		mask |= mask >> 8;
++		mask &= 0xff;
++	}
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (cpu < MAX_CPUS) {
++		a135f_gic_cpu_target[cpu] = (uint8_t)mask;
++	}
++
++	// CPU interface: unmask all but the lowest priorities, no preemption grouping, enable Group 1.
++	gicc_write32(GICC_PMR, 0xF0);
++	gicc_write32(GICC_BPR, 0);
++	uint32_t ctlr = gicc_read32(GICC_CTLR) & GICC_CTLR_DIS_BYPASS_MASK; // EOImode 0: EOIR also deactivates
++	gicc_write32(GICC_CTLR, ctlr | GICC_CTLR_ENABLEGRP1);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
+ }
+ #else
+ void
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index f932dd4..49aef1a 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,9 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ extern uint32_t a135f_vtimer_intid;
++extern vm_offset_t a135f_gicd_base;
++extern vm_offset_t a135f_gicc_base;
++extern volatile uint8_t a135f_gic_cpu_target[];
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/A135F.h b/pexpert/pexpert/arm64/A135F.h
+index 4b67f03..cb5d752 100644
+--- a/pexpert/pexpert/arm64/A135F.h
++++ b/pexpert/pexpert/arm64/A135F.h
+@@ -1,12 +1,18 @@
+ /*
+- * Board config for the Samsung Galaxy A13 (SM-A135F) ("a135f", Qualcomm SM7150 /
+- * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
++ * Board config for the Samsung Galaxy A13 (SM-A135F): Samsung Exynos850
++ * (a.k.a. Exynos3830), eight Cortex-A55 in two clusters of four (MPIDR
++ * Aff1 = cluster, Aff0 = core: 0x000-0x003 and 0x100-0x103), ARMv8.2-A, no
++ * pointer authentication, 64-byte cache lines.
+  *
+  * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
+- * implementation-defined system registers exist), 16K pages and GICv3 like
+- * VMAPPLE. Unlike VMAPPLE the GIC has two security states (GICD_TYPER
+- * SecurityExtn=1): Group 0 belongs to TrustZone, so every interrupt,
+- * including the timer, is a Group 1 IRQ taken through sleh_irq().
++ * implementation-defined system registers exist) with 16K pages.
++ *
++ * Interrupt controller: ARM GIC-400 (GICv2), NOT GICv3. There is no system
++ * register CPU interface (no ICC_*), the CPU interface and the SGI trigger
++ * are MMIO. The GIC has two security states (TrustZone): Group 0 is the
++ * secure world's, the non-secure OS gets Group 1 only, so every interrupt,
++ * including the architected virtual timer, is taken as an IRQ through
++ * sleh_irq() and acknowledged with a read of GICC_IAR.
+  */
+ 
+ #ifndef _PEXPERT_ARM64_A135F_H
+@@ -21,10 +27,8 @@
+ #define A135F_PATCH_LEVEL         "0095"
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+- * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+- * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+- * clusters yet).
++ * All eight A55 cores as one homogeneous SMP cluster: cpus=N is clamped
++ * here. PSCI CPU_ON through the Samsung EL3 monitor (smc).
+  */
+ #define A135F_SMP_MAX_CPUS         8
+ 
+@@ -39,48 +43,40 @@
+ #define __ARM_PAN_AVAILABLE__     1
+ #define __ARM_16K_PG__            1
+ 
+-#define HAS_GIC_V3                1
++/* GICv2 (GIC-400): see pexpert/arm/pe_fiq.c. HAS_GIC_V3 is deliberately unset. */
++#define A135F_GIC_V2              1
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+ #endif /* ! ASSEMBLER */
+ 
+ /*
+- * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
+- * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+- * (CNTV) is INTID 16 + 3 = 19.
++ * Exynos850 wires the architected timer PPIs the standard way (secure phys
++ * 13, non-secure phys 14, virtual 11, hyp 10); the virtual timer XNU uses
++ * (CNTV) is INTID 16 + 11 = 27. mkadt.py can override it through the
++ * "virtual-timer-intid" property of the ADT gic node.
+  */
+-#define A135F_VTIMER_INTID        19
++#define A135F_VTIMER_INTID        27
+ #define A135F_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+ 
+-#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
+-
+-/* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
+-#define GICD_CTLR                 0x0
+-
+-/* Non-secure view of GICD_CTLR (DS=0) */
+-#define GICD_CTLR_ENABLEGRP1      0x1
+-#define GICD_CTLR_ENABLEGRP1A     0x2
+-#define GICD_CTLR_ARE_NS          0x10
+-#define GICD_CTLR_RWP             0x80000000
+-
+-#define GICR_TYPER                              0x08
+-#define GICR_WAKER                              0x14
+-#define GICR_IGROUPR0                           0x10080
+-#define GICR_ISENABLER0                         0x10100
+-#define GICR_IPRIORITYR0                        0x10400
+-
+-#define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
+-#define GICR_TYPER_LAST                         0x10
+-
+-#define GICR_WAKER_PROCESSORSLEEP               0x2
+-#define GICR_WAKER_CHILDRENASLEEP               0x4
+-
+-#define ICC_CTLR_EOIMODE                        0x2
+-
+-#define ICC_SRE_SRE                             0x1
+-/* End of GICv3 register definitions */
++/* GIC-400 distributor (Arm IHI 0048B); offsets from the GICD base */
++#define GICD_CTLR                 0x000
++#define GICD_CTLR_ENABLEGRP1      0x1     /* non-secure view: enable Group 1 */
++#define GICD_ISENABLER0           0x100   /* SGIs/PPIs: banked per CPU */
++#define GICD_ICENABLER0           0x180
++#define GICD_IPRIORITYR0          0x400
++#define GICD_ITARGETSR0           0x800   /* first 32 are read-only, banked: own CPU interface */
++#define GICD_SGIR                 0xF00
++
++/* GIC-400 CPU interface; offsets from the GICC base */
++#define GICC_CTLR                 0x00
++#define GICC_CTLR_ENABLEGRP1      0x1
++#define GICC_CTLR_DIS_BYPASS_MASK 0x1e0   /* preserve the bypass-disable bits */
++#define GICC_PMR                  0x04
++#define GICC_BPR                  0x08
++#define GICC_IAR                  0x0c
++#define GICC_EOIR                 0x10
+ 
+ #endif /* ! _PEXPERT_ARM64_A135F_H */

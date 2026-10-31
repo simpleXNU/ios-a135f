@@ -1,0 +1,550 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index c64e636..943204d 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -153,6 +153,44 @@ mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
+ 	return 0;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++/*
++ * A135F: daemons started by launchd write stdout/stderr to /dev/null, and
++ * pointing a launchd job at /dev/console stops it from launching at all
++ * (backboardd, v8 image). Instead, what the processes named in boot-arg
++ * a135fnull (comma separated, default "backboardd,SpringBoard") write to
++ * /dev/null goes to the console (and so to the persistent log) as
++ * "|name| text". a135fnull=- turns it off.
++ */
++static char a135f_null_names[128];
++static int a135f_null_parsed;
++
++static bool
++a135f_null_tee(char *name, size_t len)
++{
++	if (!a135f_null_parsed) {
++		if (!PE_parse_boot_argn("a135fnull", a135f_null_names, sizeof(a135f_null_names))) {
++			strlcpy(a135f_null_names, "backboardd,SpringBoard", sizeof(a135f_null_names));
++		}
++		a135f_null_parsed = 1;
++	}
++	proc_selfname(name, (int)len);
++	size_t n = strlen(name);
++	for (const char *t = a135f_null_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++#endif
++
+ int
+ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ {
+@@ -216,6 +254,22 @@ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ 			if (rw == UIO_READ) {
+ 				return 0;
+ 			}
++#if defined(ARM64_BOARD_CONFIG_A135F)
++			{
++				char name[32];
++				if (a135f_null_tee(name, sizeof(name))) {
++					char buf[256];
++					c = MIN(uio_curriovlen(uio), sizeof(buf));
++					error = uiomove(buf, (int)c, uio);
++					if (error) {
++						break;
++					}
++					printf("|%s| %.*s%s", name, (int)c, buf,
++					    (c > 0 && buf[c - 1] == '\n') ? "" : "\n");
++					continue;
++				}
++			}
++#endif
+ 			c = uio_curriovlen(uio);
+ 
+ 			error = 0; /* Always succeeds, always consumes all input */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f41b75b..c6d7c92 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7405,15 +7405,28 @@ process_signature(proc_t p, struct image_params *imgp)
+ 				    (int64_t)imgp->ip_arch_offset, "com.apple.private.security.no-sandbox");
+ 			}
+ #endif /* DEBUG || DEVELOPMENT */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++			/*
++			 * This kernel is built as a macOS target, but everything it runs is an iOS binary and there is
++			 * no spawn-attribute platform: allow it regardless of the boot-arg or the kernel configuration
++			 * (a RELEASE build never even looks at unentitled_ios_sim_launch).
++			 */
++			no_sandbox_entitled = TRUE;
++#endif
+ 			if (!no_sandbox_entitled) {
+ 				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+ 				    EXEC_EXIT_REASON_WRONG_PLATFORM);
+ 				error = EACCES;
+ 				goto done;
+ 			}
++#if defined(ARM64_BOARD_CONFIG_A135F)
++			/* A135F runs every iOS binary this way: one short line per exec. */
++			printf("exec %s\n", p->p_name);
++#else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+ 			    "boot-arg set to true\n", p->p_name);
++#endif
+ 		} else if (psa->psa_platform != PLATFORM_IOS) {
+ 			/* Simulator binary spawned with wrong platform */
+ 			signature_failure_reason = os_reason_create(OS_REASON_EXEC,
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 1161432..297ea5c 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1884,6 +1884,20 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 		subcode = ut->uu_subcode;
+ 		etype = ut->uu_exception;
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++		if (p == current_proc()) {
++			extern void a135f_crash_log(const char *, int, int, uint64_t, uint64_t);
++			a135f_crash_log(p->p_comm, proc_getpid(p), WTERMSIG(rv),
++			    ((uint64_t)ut->uu_exception << 32) | (uint32_t)ut->uu_code, ut->uu_subcode);
++			/* abort_with_payload messages (_objc_fatal, os_crash_fmt, ...) */
++			if (PROC_HAS_EXITREASON(p)) {
++				char *desc = exit_reason_get_string_desc(p->p_exit_reason);
++				printf("CRASH %s reason ns %u code 0x%llx: %s\n", p->p_comm,
++				    p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
++				    desc != NULL ? desc : "(none)");
++			}
++		}
++#endif
+ 		/* Defualt to EXC_CRASH if the exception is not an EXC_RESOURCE or EXC_GUARD */
+ 		if (etype != EXC_RESOURCE || etype != EXC_GUARD) {
+ 			etype = EXC_CRASH;
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 2613ab5..bbe6b1e 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -2599,7 +2599,62 @@ is_io_service_match_property_table_bin(
+ 	return internal_io_service_match_property_table(service, matching, matchingCnt, matches);
+ }
+ 
+-static kern_return_t
++static 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++/*
++ * A135F IOKit trace: registry and matching calls made by the processes
++ * named in boot-arg a135f_iolog (comma separated, default "backboardd";
++ * "-" turns it off) are printed as "IOK name: ...", at most 400 lines per
++ * boot, to find out what a daemon looks for before it gives up.
++ */
++static char a135f_iolog_names[128];
++static int a135f_iolog_parsed;
++static uint32_t a135f_iolog_lines;
++
++static bool
++a135f_iolog(char *name, size_t len)
++{
++	if (!a135f_iolog_parsed) {
++		if (!PE_parse_boot_argn("a135f_iolog", a135f_iolog_names, sizeof(a135f_iolog_names))) {
++			strlcpy(a135f_iolog_names, "backboardd", sizeof(a135f_iolog_names));
++		}
++		a135f_iolog_parsed = 1;
++	}
++	if (a135f_iolog_lines >= 400) {
++		return false;
++	}
++	proc_selfname(name, (int)len);
++	size_t n = strlen(name);
++	for (const char *t = a135f_iolog_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			a135f_iolog_lines++;
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++/* Compact XML of a matching dictionary, at most 240 characters. */
++static void
++a135f_iolog_dict(const char *name, const char *what, OSObject *dict, const char *result)
++{
++	OSSerialize *ser = OSSerialize::withCapacity(256);
++	const char *text = "?";
++	if (ser != NULL && dict != NULL && dict->serialize(ser)) {
++		text = ser->text();
++	}
++	IOLog("IOK %s: %s %.240s -> %s\n", name, what, text, result);
++	OSSafeReleaseNULL(ser);
++}
++#endif
++
++kern_return_t
+ internal_io_service_get_matching_services(
+ 	mach_port_t main_port,
+ 	const char * matching,
+@@ -2619,7 +2674,23 @@ internal_io_service_get_matching_services(
+ 
+ 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+-		*existing = IOUserIterator::withIterator(IOService::getMatchingServices( dict ));
++		OSIterator *found = IOService::getMatchingServices( dict );
++#if defined(ARM64_BOARD_CONFIG_A135F)
++		char sname[32];
++		if (a135f_iolog(sname, sizeof(sname))) {
++			unsigned int count = 0;
++			if (found != NULL) {
++				while (found->getNextObject() != NULL) {
++					count++;
++				}
++				found->reset();
++			}
++			char res[16];
++			snprintf(res, sizeof(res), "%u found", count);
++			a135f_iolog_dict(sname, "matching", dict, res);
++		}
++#endif
++		*existing = IOUserIterator::withIterator(found);
+ 		kr = kIOReturnSuccess;
+ 	} else {
+ 		kr = kIOReturnBadArgument;
+@@ -2704,6 +2775,13 @@ internal_io_service_get_matching_service(
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
+ 		*service = IOService::copyMatchingService( dict );
+ 		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
++#if defined(ARM64_BOARD_CONFIG_A135F)
++		char sname[32];
++		if (a135f_iolog(sname, sizeof(sname))) {
++			a135f_iolog_dict(sname, "matching1", dict,
++			    *service ? (*service)->getMetaClass()->getClassName() : "none");
++		}
++#endif
+ 	} else {
+ 		kr = kIOReturnBadArgument;
+ 	}
+@@ -2807,6 +2885,14 @@ internal_io_service_add_notification(
+ 			continue;
+ 		}
+ 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
++#if defined(ARM64_BOARD_CONFIG_A135F)
++		{
++			char sname[32];
++			if (a135f_iolog(sname, sizeof(sname))) {
++				a135f_iolog_dict(sname, notification_type, dict, "notify");
++			}
++		}
++#endif
+ 
+ 		if ((sym == gIOPublishNotification)
+ 		    || (sym == gIOFirstPublishNotification)) {
+@@ -3274,6 +3360,15 @@ is_io_registry_entry_from_path(
+ 	}
+ 
+ 	entry = IORegistryEntry::fromPath( path );
++#if defined(ARM64_BOARD_CONFIG_A135F)
++	{
++		char sname[32];
++		if (a135f_iolog(sname, sizeof(sname))) {
++			IOLog("IOK %s: path %.200s -> %s\n", sname, path,
++			    entry ? entry->getMetaClass()->getClassName() : "none");
++		}
++	}
++#endif
+ 
+ 	if (!entry && IOTaskRegistryCompatibility(current_task())) {
+ 		OSDictionary * matching;
+@@ -4083,6 +4178,14 @@ is_io_registry_entry_get_child_iterator(
+ 
+ 	*iterator = IOUserIterator::withIterator(entry->getChildIterator(
+ 		    IORegistryEntry::getPlane( plane )));
++#if defined(ARM64_BOARD_CONFIG_A135F)
++	{
++		char sname[32];
++		if (a135f_iolog(sname, sizeof(sname))) {
++			IOLog("IOK %s: children of %s in %.32s\n", sname, entry->getName(), plane);
++		}
++	}
++#endif
+ 
+ 	return kIOReturnSuccess;
+ }
+@@ -4298,6 +4401,15 @@ is_io_service_open_extended(
+ #endif
+ 		res = service->newUserClient( owningTask, (void *) owningTask,
+ 		    connect_type, propertiesDict, &client );
++#if defined(ARM64_BOARD_CONFIG_A135F)
++		{
++			char sname[32];
++			if (a135f_iolog(sname, sizeof(sname))) {
++				IOLog("IOK %s: open %s type %u -> 0x%x\n", sname,
++				    service->getMetaClass()->getClassName(), connect_type, res);
++			}
++		}
++#endif
+ 
+ 		if (propertiesDict) {
+ 			propertiesDict->release();
+diff --git a/iokit/Kernel/arm/A135FKeyStore.cpp b/iokit/Kernel/arm/A135FKeyStore.cpp
+index c3453ae..7111b1e 100644
+--- a/iokit/Kernel/arm/A135FKeyStore.cpp
++++ b/iokit/Kernel/arm/A135FKeyStore.cpp
+@@ -45,6 +45,7 @@ enum {
+ 	kAKSAssertDrop       = 27,
+ 	kAKSUnloadSessionBags = 55,
+ 	kAKSNotifyStateSet   = 102,
++	kAKSNotifyStateIsSet = 103,
+ };
+ 
+ /* The system (device) bag handle. */
+@@ -209,6 +210,15 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutput[0] = A135F_AKS_LOCK_STATE;
+ 		args->scalarOutputCount = 1;
+ 		break;
++	case kAKSNotifyStateIsSet:
++		/* Nothing was ever set: answer "not set". */
++		if (out_scalars < 1) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		args->scalarOutput[0] = 0;
++		args->scalarOutputCount = 1;
++		break;
+ 	case kAKSGetDeviceState:
+ 		args->scalarOutputCount = 0;
+ 		ret = a135f_aks_device_state(args);
+diff --git a/iokit/Kernel/arm/A135FPlatformExpert.cpp b/iokit/Kernel/arm/A135FPlatformExpert.cpp
+index a90d169..930001c 100644
+--- a/iokit/Kernel/arm/A135FPlatformExpert.cpp
++++ b/iokit/Kernel/arm/A135FPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
+ 
+ class A135FPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(A135FPlatformExpert);
+@@ -25,6 +26,8 @@ OSDefineMetaClassAndStructors(A135FPlatformExpert, IODTPlatformExpert);
+ bool
+ A135FPlatformExpert::start(IOService *provider)
+ {
++	IOLog("A135F: patch level %s, built %s %s\n", A135F_PATCH_LEVEL, __DATE__, __TIME__);
++	IOLog("A135F: boot-args: %s\n", PE_boot_args());
+ 	IOLog("A135F: starting device-tree platform expert\n");
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index e5b23f2..eaee027 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -266,11 +266,19 @@ _cnputc(char c, bool poll)
+  *             waiting for an interrupt when the hardware device isn't ready
+  * @param size The number of characters to print to the console.
+  */
++#if defined(ARM64_BOARD_CONFIG_A135F)
++extern void a135f_log_append(const char *c, int size);  /* bsd/dev/a135f_ufs.c */
++#endif
++
+ static inline void
+ _cnputs(char *c, int size, bool poll)
+ {
+ 	extern int disableConsoleOutput;
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++	a135f_log_append(c, size);
++#endif
++
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 809dafa..d530c12 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -820,6 +820,159 @@ exception_triage(
+ 	return exception_triage_thread(exception, code, codeCnt, thread);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include <vm/vm_shared_region.h>
++#include <arm/thread.h>
++
++/*
++ * A135F crash report on the console. The phone has no way to get crash
++ * logs off the device, and corpses stop after a few crashes, so print what
++ * symbolication needs: user registers, a frame-pointer backtrace, the
++ * shared cache slide (unslid = pc - slide) and the main binary's Mach-O
++ * header (offset = pc - mh). Called from proc_prepareexit on the exiting
++ * (crashing) thread.
++ */
++void a135f_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
++static void a135f_crash_strings(const char *name);
++
++void
++a135f_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
++{
++	thread_t thread = current_thread();
++	task_t task = current_task();
++	arm_saved_state_t *ss = find_user_regs(thread);
++	uint64_t slide = 0, mh = task->mach_header_vm_address;
++
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	printf("CRASH %s[%d] sig %d code 0x%llx sub 0x%llx slide 0x%llx mh 0x%llx\n",
++	    name, pid, sig, code, subcode, slide, mh);
++	if (ss == NULL || !is_saved_state64(ss)) {
++		return;
++	}
++	uint64_t fp = get_saved_state_fp(ss);
++	printf("CRASH %s pc 0x%llx lr 0x%llx sp 0x%llx fp 0x%llx far 0x%llx\n", name,
++	    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss), fp,
++	    (uint64_t)saved_state64(ss)->far);
++
++	char line[200];
++	int n = snprintf(line, sizeof(line), "CRASH %s bt", name);
++	for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		uint64_t frame[2];
++		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++			break;
++		}
++		n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	printf("%s\n", line);
++
++	if (sig == 6 || sig == 5) {
++		a135f_crash_strings(name);
++	}
++}
++
++/*
++ * A135F: for a process named in boot-arg a135f_scan (comma separated,
++ * default "backboardd,SpringBoard"; "-" = off) that dies with SIGABRT or
++ * SIGTRAP (BSAssert / NSAssert style failures) print the printable text runs
++ * (>= 24 characters, at least 2 spaces) found in its malloc heap as
++ * "STR text", at most 700 lines. An uncaught NSException's reason string
++ * is among them: the abort message only carries the exception's type.
++ */
++static void
++a135f_crash_strings(const char *name)
++{
++	static char names[128];
++	char *buf;
++	vm_map_t map = current_map();
++	vm_map_offset_t addr = 0;
++	uint64_t scanned = 0;
++	int lines = 0;
++	char last[96] = "";
++
++	if (!PE_parse_boot_argn("a135f_scan", names, sizeof(names))) {
++		strlcpy(names, "backboardd,SpringBoard", sizeof(names));
++	}
++	size_t n = strlen(name), found = 0;
++	for (const char *t = names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			found = 1;
++			break;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	if (!found) {
++		return;
++	}
++	buf = kalloc_data(65536, Z_WAITOK);
++	if (buf == NULL) {
++		return;
++	}
++	printf("STR scan of %s heap\n", name);
++	while (lines < 700 && scanned < (96ull << 20)) {
++		vm_map_size_t size = 0;
++		natural_t depth = 0;
++		vm_region_submap_info_data_64_t info;
++		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_V2_COUNT_64;
++
++		if (vm_map_region_recurse_64(map, &addr, &size, &depth,
++		    (vm_region_submap_info_64_t)&info, &count) != KERN_SUCCESS) {
++			break;
++		}
++		vm_map_offset_t base = addr;
++		addr += size;
++		if (info.is_submap || (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) !=
++		    (VM_PROT_READ | VM_PROT_WRITE) || info.user_tag < 1 || info.user_tag > 11) {
++			continue;
++		}
++		for (vm_map_offset_t off = 0; off < size && lines < 700; off += 65536) {
++			size_t len = (size - off) < 65536 ? (size_t)(size - off) : 65536;
++			if (copyin((user_addr_t)(base + off), buf, len) != 0) {
++				continue;
++			}
++			scanned += len;
++			size_t start = 0;
++			int spaces = 0;
++			for (size_t i = 0; i <= len; i++) {
++				bool ok = i < len && ((unsigned char)buf[i] >= 0x20 && (unsigned char)buf[i] < 0x7f);
++				if (ok) {
++					spaces += buf[i] == ' ';
++					continue;
++				}
++				size_t run = i - start;
++				if (run >= 24 && spaces >= 2) {
++					char text[160];
++					size_t m = run < sizeof(text) - 1 ? run : sizeof(text) - 1;
++					memcpy(text, buf + start, m);
++					text[m] = 0;
++					if (strncmp(text, last, sizeof(last) - 1) != 0) {
++						printf("STR %s\n", text);
++						lines++;
++						strlcpy(last, text, sizeof(last));
++					}
++				}
++				start = i + 1;
++				spaces = 0;
++			}
++		}
++	}
++	printf("STR done: %llu KiB scanned, %d strings\n", scanned >> 10, lines);
++	kfree_data(buf, 65536);
++}
++#endif /* ARM64_BOARD_CONFIG_A135F */
++
+ kern_return_t
+ bsd_exception(
+ 	exception_type_t        exception,
+diff --git a/pexpert/pexpert/arm64/A135F.h b/pexpert/pexpert/arm64/A135F.h
+index c929329..4b67f03 100644
+--- a/pexpert/pexpert/arm64/A135F.h
++++ b/pexpert/pexpert/arm64/A135F.h
+@@ -17,6 +17,9 @@
+ 
+ #define A135F                     1
+ 
++/* Highest patch of xnu/patches applied to this tree; printed at boot so a photo shows what was built. */
++#define A135F_PATCH_LEVEL         "0095"
++
+ /*
+  * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+  * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI

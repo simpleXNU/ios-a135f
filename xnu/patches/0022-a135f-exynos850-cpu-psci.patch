@@ -1,0 +1,462 @@
+diff --git a/bsd/dev/a135f_mmc.c b/bsd/dev/a135f_mmc.c
+index f8ec920..c3cfa01 100644
+--- a/bsd/dev/a135f_mmc.c
++++ b/bsd/dev/a135f_mmc.c
+@@ -20,6 +20,7 @@
+  * hence cache-coherent by construction, and accessed with aligned 64-bit
+  * loads and stores only.
+  *
++ * The card rails (vmmc/vqmmc) are fixed, always-on supplies enabled by the pre-xnu bootloader.
+  * Writes are refused unless boot-arg mmcrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
+diff --git a/bsd/dev/a135f_usb.c b/bsd/dev/a135f_usb.c
+index 2a1d5f3..4c3dde6 100644
+--- a/bsd/dev/a135f_usb.c
++++ b/bsd/dev/a135f_usb.c
+@@ -12,6 +12,8 @@
+  *      Type-C/charger switch driver exists),
+  *   4. only then touches the DWC3 registers (an access to a gated block hangs).
+  * The gadget code below (EP0, CDC-ECM, UDP log stream) is generic DWC3.
++ * The USB supplies (vdd10/vdd33 in the Linux dts) are fixed rails the pre-xnu bootloader has already
++ * enabled; xnu has no regulator code and never switches them.
+  * boot-arg a135f_usb: 0 off, 1 bring up the PHY and report state, 2 (default) also start the gadget.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+diff --git a/iokit/Kernel/arm/A135FCPU.cpp b/iokit/Kernel/arm/A135FCPU.cpp
+index 641b82e..6c972f4 100644
+--- a/iokit/Kernel/arm/A135FCPU.cpp
++++ b/iokit/Kernel/arm/A135FCPU.cpp
+@@ -27,18 +27,110 @@ class A135FCPU;
+ static A135FCPU *a135f_cpus[MAX_CPUS];
+ static uint32_t a135f_cpus_registered;
+ 
++/*
++ * Secondary cores are started through a below-4 GiB trampoline. What the A13 firmware really does
++ * (found with the mailbox on hardware):
++ *  - PSCI CPU_ON works and the core runs, but PSCI AFFINITY_INFO keeps reporting OFF: ignore it;
++ *  - the real MPIDRs are 0x81000n00-style (MT set, core number in Aff1) while PSCI wants the device
++ *    tree ids (0x1, 0x2, 0x100...), and xnu's reset_vector matches MPIDR against cpu_data->cpu_phys_id.
++ * So each core's stub records its real MPIDR in a mailbox and waits; the boot CPU copies the MPIDR
++ * into cpu_phys_id (and cleans the cache line) and then releases the core.
++ * Layout at A135F_TRAMP_PA (never used by xnu): stub n at +0x100*n, mailbox slot n at +0x800 + 64*n
++ *   +0 magic 0xa135f000|n, +8 CurrentEL, +16 MPIDR_EL1, +24 stage (start.s), +32 go flag
++ * The stub also draws a yellow bar at framebuffer row 2000 + 12*n.
++ */
++#define A135F_TRAMP_PA     0xc8200000ULL
++#define A135F_TRAMP_STRIDE 0x100
++#define A135F_TRAMP_MBOX   0x800
++#define A135F_TRAMP_WORDS  32
++#define A135F_TRAMP_LIT    (A135F_TRAMP_WORDS * 4)  /* four .quad literals: framebuffer, entry, slot PA, cpu */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" void a135f_set_cpu_phys_id(int cpu, uint32_t id);
++
++static const uint32_t a135f_tramp_code[A135F_TRAMP_WORDS] = {
++	0xd53800ac, 0x58000469, 0x5800048d, 0xd29e000a, 0xf2b426aa, 0xaa0d014a, 0xd538424b, 0xf900012a,
++	0xf900052b, 0xf900092c, 0xd5033f9f, 0x580002a2, 0xd2995005, 0x9b0509a2, 0x529fe003, 0x72bfffe3,
++	0xd2821c0f, 0x52800106, 0xaa0203e7, 0x52804004, 0xb80044e3, 0x71000484, 0x54ffffc1, 0x8b0f0042,
++	0x710004c6, 0x54ffff21, 0xd5033f9f, 0xf9401121, 0xb4ffffe1, 0x580000a1, 0xd61f0020, 0xd503201f,
++};
++
++static vm_offset_t a135f_tramp_va;
++extern "C" volatile uint64_t *a135f_mbox_va;
++volatile uint64_t *a135f_mbox_va;
++
++static volatile uint64_t *
++a135f_slot(unsigned cpu)
++{
++	return (volatile uint64_t *)(a135f_tramp_va + A135F_TRAMP_MBOX) + cpu * 8;
++}
++
++/* Writes stub #cpu (entry = the real 64-bit secondary entry) and clears its mailbox slot; returns the stub's PA. */
++static uint64_t
++a135f_build_trampoline(unsigned cpu, uint64_t entry)
++{
++	if (cpu >= 8) {
++		return 0;
++	}
++	if (!a135f_tramp_va) {
++		a135f_tramp_va = ml_io_map((vm_offset_t)A135F_TRAMP_PA, 0x1000);
++	}
++	if (!a135f_tramp_va) {
++		return 0;
++	}
++	a135f_mbox_va = (volatile uint64_t *)(a135f_tramp_va + A135F_TRAMP_MBOX);
++	volatile uint64_t *slot = a135f_slot(cpu);
++	for (unsigned i = 0; i < 8; i++) {
++		slot[i] = 0;
++	}
++	volatile uint32_t *code = (volatile uint32_t *)(a135f_tramp_va + A135F_TRAMP_STRIDE * cpu);
++	for (unsigned i = 0; i < A135F_TRAMP_WORDS; i++) {
++		code[i] = a135f_tramp_code[i];
++	}
++	volatile uint64_t *lit = (volatile uint64_t *)(a135f_tramp_va + A135F_TRAMP_STRIDE * cpu + A135F_TRAMP_LIT);
++	lit[0] = 0xfa000000ULL + 2000ULL * 4320ULL;     /* bar base: the A13 framebuffer */
++	lit[1] = entry;
++	lit[2] = A135F_TRAMP_PA + A135F_TRAMP_MBOX + 64ULL * cpu;
++	lit[3] = cpu;
++	__builtin_arm_dsb(DSB_SY);
++	return A135F_TRAMP_PA + (uint64_t)A135F_TRAMP_STRIDE * cpu;
++}
++
++static void
++a135f_dump_mailbox(unsigned cpu)
++{
++	if (!a135f_tramp_va || cpu >= 8) {
++		return;
++	}
++	volatile uint64_t *m = a135f_slot(cpu);
++	IOLog("A135F CPU: cpu=%u mailbox: magic=0x%llx CurrentEL=0x%llx MPIDR=0x%llx stage=0x%llx go=0x%llx\n",
++	    cpu, (uint64_t)m[0], (uint64_t)m[1], (uint64_t)m[2], (uint64_t)m[3], (uint64_t)m[4]);
++}
++
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+-static int32_t
+-a135f_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
++static int64_t
++a135f_psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+ {
+-	register uint64_t x0 __asm__("x0") = 0xC4000003ULL;
+-	register uint64_t x1 __asm__("x1") = target;
+-	register uint64_t x2 __asm__("x2") = entry;
+-	register uint64_t x3 __asm__("x3") = context;
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
+ 	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+ 	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+ 	    "x14", "x15", "x16", "x17", "cc", "memory");
+-	return (int32_t)x0;
++	return (int64_t)x0;
++}
++
++static int32_t
++a135f_psci_cpu_on(uint64_t fn, uint64_t target, uint64_t entry, uint64_t context)
++{
++	return (int32_t)a135f_psci_call(fn, target, entry, context);
++}
++
++/* AFFINITY_INFO(target, level 0): 0 = ON, 1 = OFF, 2 = ON_PENDING, negative = error */
++static int64_t
++a135f_psci_affinity(uint64_t target)
++{
++	return a135f_psci_call(0xC4000004ULL, target, 0, 0);
+ }
+ 
+ class A135FCPU : public IOCPU {
+@@ -161,8 +253,9 @@ A135FCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !a135f_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("A135F CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
++				IOLog("A135F CPU: cpu=%u mpidr=0x%x NOT alive after 5s, AFFINITY_INFO = %lld\n",
++				    i, topology->cpus[i].phys_id, (long long)a135f_psci_affinity(topology->cpus[i].phys_id));
++				a135f_dump_mailbox(i);
+ 				panic("A135F CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+@@ -245,12 +338,44 @@ A135FCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 	IOLog("A135F CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+-	int32_t rc = a135f_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+-	IOLog("A135F CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++	unsigned idx = getCPUNumber();
++	uint64_t target = cpu->phys_id;             /* the PSCI id (device tree reg), not the hardware MPIDR */
++	uint64_t fn = 0xC4000003ULL;
++	static bool psci_probed;
++	if (!psci_probed) {
++		psci_probed = true;
++		IOLog("A135F CPU: PSCI version=0x%llx FEATURES(CPU_ON64)=0x%llx\n",
++		    (uint64_t)a135f_psci_call(0x84000000ULL, 0, 0, 0),
++		    (uint64_t)a135f_psci_call(0x8400000AULL, 0xC4000003ULL, 0, 0));
++	}
++	uint64_t t = a135f_build_trampoline(idx, entry);
++	if (!t) {
++		panic("A135F CPU: cpu=%u cannot map the trampoline page", idx);
++	}
++	/* context id 0, as Linux passes it */
++	int32_t rc = a135f_psci_cpu_on(fn, target, t, 0);
++	IOLog("A135F CPU: cpu=%u PSCI CPU_ON target=0x%llx entry=0x%llx (via 0x%llx) rc=%d\n", idx, target, (uint64_t)entry, t, rc);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+-		panic("A135F CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++		panic("A135F CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", idx, rc);
+ 	}
++	/* Wait for the core to announce itself, learn its real MPIDR, then release it. */
++	volatile uint64_t *slot = a135f_slot(idx);
++	uint64_t deadline;
++	nanoseconds_to_deadline(2 * NSEC_PER_SEC, &deadline);
++	while (slot[0] != (0xa135f000ULL | idx)) {
++		if (mach_absolute_time() > deadline) {
++			a135f_dump_mailbox(idx);
++			panic("A135F CPU: cpu=%u never reached the trampoline (PSCI target 0x%llx)", idx, target);
++		}
++		IODelay(1000);
++	}
++	uint64_t mpidr = slot[2];
++	IOLog("A135F CPU: cpu=%u psci target=0x%llx -> hardware MPIDR=0x%llx CurrentEL=0x%llx\n", idx, target, mpidr, (uint64_t)slot[1]);
++	a135f_set_cpu_phys_id((int)idx, (uint32_t)(mpidr & 0xFFFFFF));
++	__builtin_arm_dsb(DSB_SY);
++	slot[4] = 1;                                /* go */
++	__builtin_arm_dsb(DSB_SY);
+ 	return KERN_SUCCESS;
+ }
+ 
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index dd60cea..b70d134 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = A135FCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = 'arm,cortex-a55';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index f2f3170..5dc45a7 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -676,6 +676,12 @@ void
+ arm_init_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
++#if defined(A135F)
++	extern volatile uint64_t *a135f_mbox_va;
++	if (a135f_mbox_va && cpu_data_ptr->cpu_number < 8) {
++		a135f_mbox_va[cpu_data_ptr->cpu_number * 8 + 3] = 0x60;        /* MMU on, running C */
++	}
++#endif
+ #if __ARM_PAN_AVAILABLE__
+ 	__builtin_arm_wsr("pan", 1);
+ #endif
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index a8fe0a0..7ef8eae 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -1294,3 +1294,21 @@ sleep_token_buffer_init(void)
+ 	}
+ }
+ #endif
++
++#if defined(A135F)
++/*
++ * The A13 firmware starts a secondary with the real MPIDR (MT set, core in Aff1) which differs from the
++ * PSCI id in the device tree; reset_vector matches MPIDR against cpu_phys_id, so A135FCPU::startCPU
++ * stores the MPIDR it learned from the core's trampoline here before releasing the core.
++ */
++void a135f_set_cpu_phys_id(int cpu, uint32_t id);
++void
++a135f_set_cpu_phys_id(int cpu, uint32_t id)
++{
++	extern void a135f_set_cpu_mpidr(int cpu, uint32_t id);
++	cpu_data_t *cdp = cpu_datap(cpu);
++	cdp->cpu_phys_id = id;
++	CleanPoC_DcacheRegion((vm_offset_t)cdp, sizeof(*cdp));
++	a135f_set_cpu_mpidr(cpu, id);           /* ml_get_cpu_number_local() looks the core up here */
++}
++#endif
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 155647b..5fb6ad6 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1205,6 +1205,47 @@ ml_get_boot_cluster_type(void)
+ 	return topology_info.boot_cluster->cluster_type;
+ }
+ 
++#if defined(A135F)
++/*
++ * A13: the cores' real MPIDRs (0x81000n00: core number in Aff1) differ from the device-tree/PSCI ids
++ * kept in topology_info (which is read-only after machine_lockdown()). A135FCPU::startCPU learns each
++ * core's real MPIDR from its trampoline and records it in this writable table before releasing the
++ * core; ml_get_cpu_number() consults it first. Compared on Aff2:Aff1:Aff0.
++ */
++static volatile uint32_t a135f_real_mpidr[MAX_CPUS];
++static volatile uint8_t a135f_real_valid[MAX_CPUS];
++
++void a135f_set_cpu_mpidr(int cpu, uint32_t id);
++void
++a135f_set_cpu_mpidr(int cpu, uint32_t id)
++{
++	assert(cpu >= 0 && (unsigned)cpu < MAX_CPUS);
++	a135f_real_mpidr[cpu] = id;
++	__builtin_arm_dmb(DMB_ISH);
++	a135f_real_valid[cpu] = 1;
++	__builtin_arm_dsb(DSB_ISH);
++}
++
++int
++ml_get_cpu_number(uint32_t phys_id)
++{
++	phys_id &= MPIDR_AFF2_MASK | MPIDR_AFF1_MASK | MPIDR_AFF0_MASK;
++
++	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
++		if (a135f_real_valid[i] && a135f_real_mpidr[i] == phys_id) {
++			return i;
++		}
++	}
++	/* cores not yet learned (and the boot CPU) are known by their device-tree id */
++	for (unsigned i = 0; i < topology_info.num_cpus; i++) {
++		if (!a135f_real_valid[i] && topology_info.cpus[i].phys_id == phys_id) {
++			return i;
++		}
++	}
++
++	return -1;
++}
++#else
+ int
+ ml_get_cpu_number(uint32_t phys_id)
+ {
+@@ -1218,6 +1259,7 @@ ml_get_cpu_number(uint32_t phys_id)
+ 
+ 	return -1;
+ }
++#endif
+ 
+ int
+ ml_get_cluster_number(uint32_t phys_id)
+@@ -2065,7 +2107,12 @@ ml_set_decrementer(uint32_t dec_value)
+ static inline uint64_t
+ nonspeculative_timebase(void)
+ {
+-#if defined(HAS_ACNTVCT)
++#if defined(A135F)
++	/* The Samsung firmware leaves a different CNTVOFF on each core, so CNTVCT_EL0 differs between CPUs;
++	 * the physical counter is common to all of them. (The timer still uses CNTV_TVAL: relative.) */
++	__builtin_arm_isb(ISB_SY);
++	return __builtin_arm_rsr64("CNTPCT_EL0");
++#elif defined(HAS_ACNTVCT)
+ 	return __builtin_arm_rsr64("ACNTVCT_EL0");
+ #elif __ARM_ARCH_8_6__
+ 	return __builtin_arm_rsr64("CNTVCTSS_EL0");
+@@ -2146,8 +2193,11 @@ ml_get_speculative_timebase(void)
+ 	do {
+ 		timebase = getCpuDatap()->cpu_base_timebase;
+ 		os_compiler_barrier();
++#if defined(A135F)
++		clock = __builtin_arm_rsr64("CNTPCT_EL0");     /* common to all cores, see nonspeculative_timebase() */
++#else
+ 		clock = __builtin_arm_rsr64("CNTVCT_EL0");
+-
++#endif
+ 		os_compiler_barrier();
+ 	} while (getCpuDatap()->cpu_base_timebase != timebase);
+ 
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index 9db008d..434a07a 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -213,7 +213,7 @@
+ /* D-Cache. */
+ #define MMU_CLINE   6
+ 
+-#elif defined (A135F) /* Qualcomm Kryo 470: Cortex-A76 + Cortex-A55 */
++#elif defined (A135F) /* Exynos850: Cortex-A55, 64-byte cache lines */
+ 
+ /* I-Cache. */
+ #define MMU_I_CLINE 6
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index b1cda04..3f95fc6 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -42,6 +42,29 @@
+ 
+ 
+ 
++#if defined(A135F)
++/*
++ * Secondary-core progress marker for bring-up: MMU is off when this runs, so it stores a stage code
++ * straight to the physical mailbox (0xc8200800 + 64 * slot + 24) that A135FCPU.cpp reads back if the core
++ * never reports in. Clobbers x9-x11 only.
++ */
++.macro A135F_STAGE
++	mrs		x9, MPIDR_EL1
++	ubfx	x10, x9, #8, #2			// Aff1 = core on the A13 (0-3)
++	ubfx	x11, x9, #16, #1			// Aff2[0] = cluster
++	add		x10, x10, x11, lsl #2
++	lsl		x10, x10, #6
++	MOV64	x11, 0xc8200818				// mailbox slot base + 24 (stage word)
++	add		x10, x10, x11
++	mov		x11, #$0
++	str		x11, [x10]
++	dsb		sy
++.endmacro
++#else
++.macro A135F_STAGE
++.endmacro
++#endif
++
+ .macro MSR_VBAR_EL1_X0
+ #if defined(KERNEL_INTEGRITY_KTRR)
+ 	mov	x1, lr
+@@ -139,12 +162,15 @@ LEXT(reset_vector)
+ 
+ 
+ 
++	A135F_STAGE 0x53
+ 	// Process reset handlers
+ 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
+ 	add		x19, x19, EXT(ResetHandlerData)@pageoff
+ 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
+-#if HAS_CLUSTER || defined(A135F)
+-	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (A135F: core in Aff1)
++#if defined(A135F)
++	and		x0, x15, #0xFFFFFF					// Aff2:Aff1:Aff0: cpu_phys_id is learned from the real MPIDR
++#elif HAS_CLUSTER
++	and		x0, x15, #0xFFFF					// Full Aff1:Aff0
+ #else
+ 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
+ #endif
+@@ -191,8 +217,10 @@ Lfound_cpu_data_entry:
+ 	msr		TPIDR_EL1, x13
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
++	A135F_STAGE 0x54
+ 	blr		x0
+ Lskip_cpu_reset_handler:
++	A135F_STAGE 0x5f
+ 	b		.									// Hang if the handler is NULL or returns
+ 
+ 	.align 3
+@@ -289,6 +317,7 @@ LEXT(bootstrap_instructions)
+ 	.globl EXT(a135f_secondary_entry)
+ LEXT(a135f_secondary_entry)
+ 	msr		DAIFSet, #0xf
++	A135F_STAGE 0x51
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	La135f_secondary_el1
+@@ -320,6 +349,7 @@ LEXT(a135f_secondary_entry)
+ La135f_secondary_bad_el:
+ 	b		.
+ La135f_secondary_el1:
++	A135F_STAGE 0x52
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+@@ -341,6 +371,7 @@ LEXT(start_cpu)
+ 
+ 	.align 2
+ start_cpu:
++	A135F_STAGE 0x56
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ 	// This is done right away in reset vector for pre-KTRR devices
+ 	// Set low reset vector now that we are in the KTRR-free zone
+@@ -829,6 +860,11 @@ common_start:
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++#if defined(A135F)
++	cbz		x21, 1f
++	A135F_STAGE 0x57
++1:
++#endif
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0

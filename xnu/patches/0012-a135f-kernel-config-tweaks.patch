@@ -1,0 +1,79 @@
+diff --git a/bsd/kern/kern_core.c b/bsd/kern/kern_core.c
+index a7cc1e6..2a0e1db 100644
+--- a/bsd/kern/kern_core.c
++++ b/bsd/kern/kern_core.c
+@@ -34,6 +34,7 @@
+  */
+ #if CONFIG_COREDUMP
+ 
++#include <pexpert/arm64/board_config.h>
+ #include <mach/vm_param.h>
+ #include <mach/thread_status.h>
+ #include <sys/content_protection.h>
+@@ -116,7 +117,12 @@ kern_return_t thread_getstatus(thread_t act, int flavor,
+     thread_state_t tstate, mach_msg_type_number_t *count);
+ void task_act_iterate_wth_args(task_t, void (*)(thread_t, void *), void *);
+ 
+-#ifdef SECURE_KERNEL
++#if defined(SECURE_KERNEL) || defined(ARM64_BOARD_CONFIG_A135F)
++/*
++ * A135F: off by default (sysctl kern.coredump=1 enables it). A crashing iOS
++ * daemon maps the whole shared region, so one core is gigabytes on the root
++ * volume and takes minutes on the phone's UFS.
++ */
+ __XNU_PRIVATE_EXTERN int do_coredump = 0;       /* default: don't dump cores */
+ #else
+ __XNU_PRIVATE_EXTERN int do_coredump = 1;       /* default: dump cores */
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index 5b8e184..acaad46 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -650,7 +650,7 @@
+ 432	AUE_NULL	ALL	{ int audit_session_port(au_asid_t asid, user_addr_t portnamep); }
+ 433	AUE_NULL	ALL	{ int pid_suspend(int pid); }
+ 434	AUE_NULL	ALL	{ int pid_resume(int pid); }
+-#if CONFIG_EMBEDDED
++#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_A135F)
+ 435	AUE_NULL	ALL	{ int pid_hibernate(int pid); }
+ #else
+ 435     AUE_NULL        ALL     { int nosys(void); }
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index 336c84d..17cbd6d 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -1755,7 +1755,12 @@ out:
+ 	return error;
+ }
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_A135F)
++/*
++ * A135F runs the iOS userland on the macOS config: SpringBoard calls
++ * pid_hibernate when an app leaves the foreground, and nosys (SIGSYS)
++ * killed it. Without CONFIG_FREEZE this returns 0, as on iOS.
++ */
+ /*
+  * Freeze the specified process (provided in args->pid), or find and freeze a PID.
+  * When a process is specified, this call is blocking, otherwise we wake up the
+@@ -1817,7 +1822,7 @@ out:
+ 	*ret = error;
+ 	return error;
+ }
+-#endif /* !XNU_TARGET_OS_OSX */
++#endif /* !XNU_TARGET_OS_OSX || A135F */
+ 
+ #if SOCKETS
+ int
+diff --git a/config/MASTER.arm64.a135f b/config/MASTER.arm64.a135f
+index cf94863..1eaac3e 100644
+--- a/config/MASTER.arm64.a135f
++++ b/config/MASTER.arm64.a135f
+@@ -31,7 +31,7 @@
+ #  BSD_RELEASE =    [ BSD_BASE ]
+ #  BSD_DEV =        [ BSD_BASE config_vnguard ]
+ #  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
+-#  FILESYS_BASE =   [ devfs fdesc fifo mockfs a135f_hfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_BASE =   [ devfs fdesc fifo mockfs a135f_hfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_searchfs config_volfs config_appledouble nullfs bindfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
+ #  FILESYS_RELEASE= [ FILESYS_BASE ]
+ #  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
+ #  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]

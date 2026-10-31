@@ -1,0 +1,389 @@
+diff --git a/iokit/Kernel/arm/A135FFramebuffer.cpp b/iokit/Kernel/arm/A135FFramebuffer.cpp
+index d8ebbdd..9a2aff7 100644
+--- a/iokit/Kernel/arm/A135FFramebuffer.cpp
++++ b/iokit/Kernel/arm/A135FFramebuffer.cpp
+@@ -15,7 +15,12 @@
+  *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
+  *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
+  *      +0x104 enabled layer mask
+- *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h], 18 IsMainDisplay,
++ *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
++ *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
++ *      button / auto-lock), else on. Off fades the panel out over a few
++ *      vsyncs (halving each pixel) and keeps it black until on again;
++ *      the panel itself stays powered (AMOLED black pixels are off).
++ *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+  *
+@@ -26,11 +31,13 @@
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+- * the GUI by default: pausing it (boot-arg a135f_fb_noconsole=1, on the
+- * first swap) switches the console to serial, which also hides panics.
++ * the GUI by default: boot-arg a135f_fb_noconsole=1 stops drawing it from
++ * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "A135FSurface.h"
+ 
++extern "C" int a135f_console_muted;     /* osfmk/console/serial_console.c */
++
+ #if defined(A135F)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+@@ -51,6 +58,7 @@ enum {
+ 	kA135FFBSwapWait                = 6,
+ 	kA135FFBGetID                   = 7,
+ 	kA135FFBGetDisplaySize          = 8,
++	kA135FFBRequestPowerChange      = 12,
+ 	kA135FFBIsMainDisplay           = 18,
+ 	kA135FFBGetDotPitch             = 28,
+ 	kA135FFBNotifications           = 72,
+@@ -61,7 +69,17 @@ enum {
+ #define A135F_FB_NOTIFY_TYPES           8
+ #define A135F_FB_NOTIFY_VSYNC           5
+ #define A135F_FB_VSYNC_US               16667
+-#define A135F_FB_DOT_PITCH              395     /* ppi, 6.67" 1080x2400 */
++#define A135F_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++/*
++ * The iOS userland only has status bar / layout data for real iPhone
++ * screens (UIKit: "No status bar visual provider for screen", the red
++ * rdar://45025538 bar for 360x800 points). The display is therefore
++ * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
++ * centered 1080x2400 part of it is shown on the 1080x2400 panel.
++ * Boot-arg a135f_fb_native=1 presents the real panel size instead.
++ */
++#define A135F_FB_LOGICAL_W              1125
++#define A135F_FB_LOGICAL_H              2436
+ #define A135F_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -84,6 +102,8 @@ class AppleCLCD : public IOMobileFramebuffer {
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
++	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
++	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	A135FSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -91,11 +111,17 @@ public:
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
++	uint8_t       fPending[A135F_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
++	bool          fDirty;
++	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
++	bool          fPowerOff;      /* RequestPowerChange(0) */
++	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	void present(const uint8_t *rec);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -140,6 +166,16 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("A135F FB: no boot framebuffer\n");
+ 		return false;
+ 	}
++	int native = 0;
++	PE_parse_boot_argn("a135f_fb_native", &native, sizeof(native));
++	fLogicalW = fWidth;
++	fLogicalH = fHeight;
++	if (!native && fWidth <= A135F_FB_LOGICAL_W && fHeight <= A135F_FB_LOGICAL_H) {
++		fLogicalW = A135F_FB_LOGICAL_W;
++		fLogicalH = A135F_FB_LOGICAL_H;
++	}
++	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
++	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = a135f_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, A135F_FB_FORMAT_BGRA);
+@@ -156,14 +192,17 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("A135F FB: no vsync timer\n");
+ 		return false;
+ 	}
++	uint32_t hz = 10;
++	PE_parse_boot_argn("a135f_fb_hz", &hz, sizeof(hz));
++	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(A135F_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("A135F FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
++	IOLog("A135F FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
+@@ -185,7 +224,38 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(A135F_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if (fb->fPowerOff) {
++		/* Fade out: halve every channel each vsync, then black, then idle. */
++		uint32_t step = fb->fFadeStep;
++		if (step <= 6) {
++			fb->fFadeStep = step + 1;
++		}
++		IOLockUnlock(fb->fLock);
++		if (step <= 6) {
++			for (uint32_t y = 0; y < fb->fHeight; y++) {
++				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				for (uint32_t x = 0; x < fb->fWidth; x++) {
++					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++				}
++			}
++		}
++		sender->setTimeoutUS(A135F_FB_VSYNC_US);
++		return;
++	}
++	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	uint8_t *rec = NULL;
++	if (flush) {
++		rec = (uint8_t *)IOMallocData(A135F_FB_SWAP_REC_SIZE);
++		if (rec != NULL) {
++			memcpy(rec, fb->fPending, A135F_FB_SWAP_REC_SIZE);
++			fb->fDirty = false;
++		}
++	}
+ 	IOLockUnlock(fb->fLock);
++	if (rec != NULL) {
++		fb->present(rec);
++		IOFreeData(rec, A135F_FB_SWAP_REC_SIZE);
++	}
+ 	sender->setTimeoutUS(A135F_FB_VSYNC_US);
+ }
+ 
+@@ -220,22 +290,37 @@ static uint32_t a135f_fb_swaps_logged;
+ static uint64_t a135f_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
++/*
++ * A swap only records the frame: copying 10 MB into the panel on every
++ * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
++ * shows the latest frame every fFlushTicks ticks (boot-arg a135f_fb_hz,
++ * default 10 Hz).
++ */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	uint32_t mask = get32(rec, 0x104);
+-
+-	if ((++a135f_fb_swap_count % 100) == 0) {
++	IOLockLock(fLock);
++	memcpy(fPending, rec, A135F_FB_SWAP_REC_SIZE);
++	fDirty = true;
++	IOLockUnlock(fLock);
++	if ((++a135f_fb_swap_count % 1000) == 0) {
+ 		IOLog("A135F FB: %llu swaps\n", a135f_fb_swap_count);
+ 	}
++}
++
++void
++AppleCLCD::present(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+ 		if (PE_parse_boot_argn("a135f_fb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-			PE_Video video;
+-			PE_current_console(&video);
+-			PE_initialize_console(&video, kPEDisableScreen);
++			/* Not PE_initialize_console(kPEDisableScreen): its console switch
++			 * writes the read-only-late cons_ops_index and panics. */
++			a135f_console_muted = 1;
+ 		}
+ 	}
+ 
+@@ -274,6 +359,19 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		/* Logical (presented) display coordinates -> panel coordinates. */
++		dx -= fOffX;
++		dy -= fOffY;
++		if (dx < 0) {
++			sx -= dx;
++			w += dx;
++			dx = 0;
++		}
++		if (dy < 0) {
++			sy -= dy;
++			h += dy;
++			dy = 0;
++		}
+ 		if (w > (int32_t)s->width - sx) {
+ 			w = (int32_t)s->width - sx;
+ 		}
+@@ -409,8 +507,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		outCount = 1;
+ 		break;
+ 	case kA135FFBGetDisplaySize:
+-		out[0] = fFB->fWidth;
+-		out[1] = fFB->fHeight;
++		out[0] = fFB->fLogicalW;
++		out[1] = fFB->fLogicalH;
+ 		outCount = 2;
+ 		break;
+ 	case kA135FFBIsMainDisplay:
+@@ -434,6 +532,19 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			    args->scalarInput[0] ? "on" : "off");
+ 		}
+ 		break;
++	case kA135FFBRequestPowerChange:
++		if (args->scalarInputCount >= 1) {
++			bool off = args->scalarInput[0] == 0;
++			IOLockLock(fFB->fLock);
++			if (off != fFB->fPowerOff) {
++				fFB->fPowerOff = off;
++				fFB->fFadeStep = 0;
++				fFB->fDirty = true;     /* on: redraw the latest frame */
++			}
++			IOLockUnlock(fFB->fLock);
++			IOLog("A135F FB: display %s\n", off ? "off" : "on");
++		}
++		break;
+ 	case kA135FFBSwapWait:
+ 	default:
+ 		break;
+diff --git a/iokit/Kernel/arm/A135FSurface.cpp b/iokit/Kernel/arm/A135FSurface.cpp
+index 093d84a..b7a2b6d 100644
+--- a/iokit/Kernel/arm/A135FSurface.cpp
++++ b/iokit/Kernel/arm/A135FSurface.cpp
+@@ -407,7 +407,7 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	OSArray *fRefs;
+ 
+ 	A135FSurfaceRef *findRef(uint32_t id, unsigned int *index);
+-	IOReturn addRef(A135FSurface *s, A135FSurfaceRef **refOut);
++	IOReturn addRef(A135FSurface *s, A135FSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(A135FSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+ 
+@@ -495,17 +495,25 @@ IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
++ *
++ * A lookup of a surface this client already has maps nothing and counts
++ * nothing (*existing): IOSurface.framework then gets base address -1 in the
++ * lock result and reuses its cached IOSurfaceClient. Counting it instead
++ * made the framework build a second client for the same id; releasing that
++ * one (traps 4 + 5) unmapped the memory under the first (backboardd
++ * snapshot crash in CGDataProviderCreateWithData).
+  */
+ IOReturn
+-IOSurfaceRootUserClient::addRef(A135FSurface *s, A135FSurfaceRef **refOut)
++IOSurfaceRootUserClient::addRef(A135FSurface *s, A135FSurfaceRef **refOut, bool *existing)
+ {
++	*existing = false;
+ 	IOLockLock(fLock);
+ 	A135FSurfaceRef *ref = findRef(s->id, NULL);
+ 	if (ref != NULL && ref->surface == s) {
+-		ref->count++;
+ 		IOLockUnlock(fLock);
+ 		a135f_surface_put(s);
+ 		*refOut = ref;
++		*existing = true;
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -615,7 +623,8 @@ IOReturn
+ IOSurfaceRootUserClient::returnSurface(A135FSurface *s, IOExternalMethodArguments *args)
+ {
+ 	A135FSurfaceRef *ref = NULL;
+-	IOReturn ret = addRef(s, &ref);
++	bool existing = false;
++	IOReturn ret = addRef(s, &ref, &existing);
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
+@@ -624,10 +633,13 @@ IOSurfaceRootUserClient::returnSurface(A135FSurface *s, IOExternalMethodArgument
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+ 		a135f_surface_fill_result(s, ref, out);
++		if (existing) {
++			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
++		}
+ 		ret = a135f_struct_out(args, out, A135F_SURFACE_RESULT_SIZE);
+ 		IOFreeData(out, A135F_SURFACE_RESULT_SIZE);
+ 	}
+-	if (ret != kIOReturnSuccess) {
++	if (ret != kIOReturnSuccess && !existing) {
+ 		/* The caller never learns the id: undo this create/lookup. */
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}
+diff --git a/iokit/Kernel/arm/hid/A135FHID.cpp b/iokit/Kernel/arm/hid/A135FHID.cpp
+index 25ea6f6..b063832 100644
+--- a/iokit/Kernel/arm/hid/A135FHID.cpp
++++ b/iokit/Kernel/arm/hid/A135FHID.cpp
+@@ -367,6 +367,7 @@ protected:
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
++	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[A135F_TOUCH_FINGERS];
+ 	bool fEdge[A135F_TOUCH_FINGERS];
+ 	IOFixed fX[A135F_TOUCH_FINGERS];
+@@ -431,6 +432,12 @@ A135FHIDTouch::start(IOService *provider)
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
++	int native = 0;
++	PE_parse_boot_argn("a135f_fb_native", &native, sizeof(native));
++	fLogicalW = native ? 1080 : 1125;
++	fLogicalH = native ? 2400 : 2436;
++	fOffX = (fLogicalW - 1080) / 2;
++	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -456,8 +463,9 @@ A135FHIDTouch::touch(int finger, bool down, int x, int y)
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1080);
+-	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 2400);
++	/* Panel pixels -> the presented 1125x2436 display (A135FFramebuffer.cpp). */
++	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index eaee027..0240f57 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -268,6 +268,12 @@ _cnputc(char c, bool poll)
+  */
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ extern void a135f_log_append(const char *c, int size);  /* bsd/dev/a135f_ufs.c */
++/*
++ * Set by AppleCLCD (boot-arg a135f_fb_noconsole=1) once the GUI presents:
++ * console text still goes to the persistent log, but is not drawn over
++ * the GUI. A panic draws again.
++ */
++int a135f_console_muted;
+ #endif
+ 
+ static inline void
+@@ -277,6 +283,9 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_A135F)
+ 	a135f_log_append(c, size);
++	if (a135f_console_muted && !panic_active()) {
++		return;
++	}
+ #endif
+ 
+ 	if (disableConsoleOutput) {
