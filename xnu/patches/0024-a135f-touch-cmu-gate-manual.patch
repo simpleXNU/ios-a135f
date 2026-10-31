@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/a135f_touch.c b/bsd/dev/a135f_touch.c
+index 9f0f566..60a66b3 100644
+--- a/bsd/dev/a135f_touch.c
++++ b/bsd/dev/a135f_touch.c
+@@ -58,6 +58,8 @@ void a135f_touch_init(void);
+ #define CMU_GAT_USI0_P  0x2048
+ #define CMU_BUSY        (1u << 16)
+ #define CMU_GATE_EN     (1u << 21)
++#define CMU_GATE_MANUAL (1u << 20)      /* "reserved"; overrides automatic gating */
++#define CMU_GATE_HWACG  (1u << 28)      /* hardware automatic clock gating */
+ #define SYSREG_USI0_CONF 0x2000         /* USIv2 SW_CONF: BIT(1) = SPI */
+ #define USI_CON         0xc4            /* USI block (SPI_PA + 0xc0) + 0x04: BIT(0) = reset */
+ 
+@@ -276,6 +278,19 @@ cmu_wait(uint32_t off)
+ 	}
+ }
+ 
++/* clk-exynos-arm64.c exynos_arm64_init_clocks(): every gate is put in manual mode (GATE_MANUAL set,
++ * GATE_ENABLE_HWACG cleared) before clk_enable() sets bit 21. Left in automatic mode the USI clock
++ * is gated again mid-transfer and the SPI FIFO stalls. */
++static void
++cmu_gate_on(uint32_t off)
++{
++	uint32_t v = rd32(cmu, off);
++
++	v |= CMU_GATE_MANUAL | CMU_GATE_EN;
++	v &= ~CMU_GATE_HWACG;
++	wr32(cmu, off, v);
++}
++
+ static void
+ pin_func(uint32_t bank, unsigned pin, unsigned func)
+ {
+@@ -371,8 +386,8 @@ spi_hw_init(void)
+ 	cmu_wait(CMU_MUX_USI0);
+ 	wr32(cmu, CMU_DIV_USI0, 1);
+ 	cmu_wait(CMU_DIV_USI0);
+-	wr32(cmu, CMU_GAT_USI0_P, rd32(cmu, CMU_GAT_USI0_P) | CMU_GATE_EN);
+-	wr32(cmu, CMU_GAT_USI0_IP, rd32(cmu, CMU_GAT_USI0_IP) | CMU_GATE_EN);
++	cmu_gate_on(CMU_GAT_USI0_P);
++	cmu_gate_on(CMU_GAT_USI0_IP);
+ 	/* USI: SPI mode, out of reset (exynos-usi.c) */
+ 	wr32(sysreg, SYSREG_USI0_CONF, (1u << 1));
+ 	wr32(spi, USI_CON, rd32(spi, USI_CON) & ~1u);
+@@ -416,6 +431,10 @@ spi_selftest(void)
+ 	wr32(spi, SPI_MODE_CFG, rd32(spi, SPI_MODE_CFG) & ~MODE_LOOPBACK);
+ 	spi_loop_ok = (e == 0 && memcmp(pat, got, sizeof(pat)) == 0);
+ 	spi_loop_done = true;
++	printf("A135F TOUCH: SPI regs gatip %08x gatp %08x mux %08x div %08x usicon %08x sysreg %08x ch %08x mode %08x st %08x\n",
++	    rd32(cmu, CMU_GAT_USI0_IP), rd32(cmu, CMU_GAT_USI0_P), rd32(cmu, CMU_MUX_USI0), rd32(cmu, CMU_DIV_USI0),
++	    rd32(spi, USI_CON), rd32(sysreg, SYSREG_USI0_CONF), rd32(spi, SPI_CH_CFG), rd32(spi, SPI_MODE_CFG),
++	    rd32(spi, SPI_STATUS));
+ 	printf("A135F TOUCH: SPI loopback %s (err %d, rx %02x %02x %02x %02x)\n",
+ 	    spi_loop_ok ? "ok" : "FAILED", e, got[0], got[1], got[2], got[3]);
+ }
