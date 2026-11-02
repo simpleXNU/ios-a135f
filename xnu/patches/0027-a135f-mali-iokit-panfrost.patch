@@ -1,0 +1,500 @@
+diff --git a/iokit/Kernel/arm/A135FMali.cpp b/iokit/Kernel/arm/A135FMali.cpp
+new file mode 100644
+index 0000000..a1d221b
+--- /dev/null
++++ b/iokit/Kernel/arm/A135FMali.cpp
+@@ -0,0 +1,482 @@
++/*
++ * A135FMali: the Galaxy A13's Mali-G52 for programs to draw with.
++ *
++ * bsd/dev/a135f_mali.c brings the GPU up (boot-arg a135f_mali=1) and, once a job has run through
++ * its page tables, starts this service. A program that opens it speaks the interface of Linux's
++ * panfrost DRM driver, the one Mesa's panfrost knows: every request is a call of the user client
++ * with the request's number as the selector and its structure passed in and back. What Linux does
++ * with mmap() on the device is the client memory of the type that is the buffer's handle.
++ *
++ * IOSurfaces are the built-in A135FSurface; jobs run to their end inside the submit call (a135f_mali_run),
++ * so waits are already satisfied; the CPU's caches are cleaned/invalidated around a job for
++ * surface-backed buffers (the GPU is not coherent).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(A135F)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++
++#include "A135FSurface.h"
++
++extern "C" {
++void a135f_mali_flush(uint64_t va, uint64_t len);
++bool a135f_mali_ready(void);
++bool a135f_mali_parameter(uint32_t which, uint64_t * value);
++uint64_t a135f_mali_address(uint64_t size);
++bool a135f_mali_map(uint64_t gpu, uint64_t phys);
++void a135f_mali_unmap(uint64_t gpu, uint64_t size);
++void a135f_mali_mapped(void);
++uint64_t a135f_mali_run(uint64_t chain, bool fragment, uint32_t * status);
++void A135FMaliStart(void);
++}
++
++/* Linux's include/uapi/drm/panfrost_drm.h and drm.h: the requests' numbers and structures. */
++enum {
++	kDrmGemClose            = 0x09,
++	kPanfrostSubmit         = 0x40,
++	kPanfrostWaitBO         = 0x41,
++	kPanfrostCreateBO       = 0x42,
++	kPanfrostMmapBO         = 0x43,
++	kPanfrostGetParam       = 0x44,
++	kPanfrostGetBOOffset    = 0x45,
++	kPanfrostMadvise        = 0x48,
++	kA135FWait              = 0x7d,         /* ours: wait for a job by number (always already done) */
++	kA135FSurface           = 0x7e,         /* ours: an IOSurface's memory as a buffer */
++};
++
++struct a135f_surface_req {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t handle;                        /* kA135FDescribe: no buffer wanted; else, back: the buffer */
++	uint64_t size;
++	uint32_t offset, rowBytes;
++	uint32_t width, height, pixelFormat, planes;
++};
++#define kA135FDescribe 0xffffffffu
++
++struct a135f_wait {
++	uint64_t seq;
++	int64_t timeout_ns;
++};
++
++struct drm_gem_close { uint32_t handle, pad; };
++struct drm_panfrost_submit {
++	uint64_t jc;
++	uint64_t in_syncs;
++	uint32_t in_sync_count;
++	uint32_t out_sync;
++	uint64_t bo_handles;
++	uint32_t bo_handle_count;
++	uint32_t requirements;
++};
++#define PANFROST_JD_REQ_FS      (1u << 0)
++struct drm_panfrost_wait_bo { uint32_t handle, pad; int64_t timeout_ns; };
++struct drm_panfrost_create_bo { uint32_t size, flags, handle, pad; uint64_t offset; };
++struct drm_panfrost_mmap_bo { uint32_t handle, flags; uint64_t offset; };
++struct drm_panfrost_get_param { uint32_t param, pad; uint64_t value; };
++struct drm_panfrost_get_bo_offset { uint32_t handle, pad; uint64_t offset; };
++struct drm_panfrost_madvise { uint32_t handle, madv, retained; };
++
++#define MALI_BUFFERS            4096
++#define MALI_BUFFER_MAX         (256ull << 20)
++
++struct mali_buffer {
++	IOMemoryDescriptor * memory;
++	A135FSurface * surface;                 /* set when the pixels of an IOSurface */
++	uint64_t address, size;
++};
++
++static IOLock * gMaliLock;
++static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits, gMaliFailed;
++
++class A135FMali : public IOService
++{
++	OSDeclareDefaultStructors(A135FMali);
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(A135FMali, IOService);
++
++bool
++A135FMali::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "A135FMaliUserClient");
++	setName("A135FMali");
++	registerService();
++	return true;
++}
++
++void
++A135FMaliStart(void)
++{
++	IOService * provider = IOService::getPlatform();
++	A135FMali * gpu;
++
++	gMaliLock = IOLockAlloc();
++	gpu = OSTypeAlloc(A135FMali);
++	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("A135FMali: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("A135FMali: the service did not start\n");
++	}
++	gpu->release();
++	IOLog("A135FMali: the GPU is there for programs to draw with\n");
++}
++
++class A135FMaliUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(A135FMaliUserClient);
++
++	struct mali_buffer * fBuffers;
++	uint32_t fNextBuffer;
++	uint32_t fSubmits, fFailed, fRequests;
++
++	struct mali_buffer * buffer(uint32_t handle);
++	void freeBuffer(struct mali_buffer * b);
++	struct mali_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle);
++	IOReturn createBO(struct drm_panfrost_create_bo * request);
++	IOReturn surfaceBuffer(struct a135f_surface_req * request);
++	void syncSurfaces(const uint32_t * handles, uint32_t n);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(A135FMaliUserClient, IOUserClient);
++
++bool
++A135FMaliUserClient::start(IOService * provider)
++{
++	if (!a135f_mali_ready() || !IOUserClient::start(provider)) {
++		IOLog("A135FMali: a client could not be started\n");
++		return false;
++	}
++	OSIncrementAtomic((SInt32 *) &gMaliClients);
++	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
++	return fBuffers != NULL;
++}
++
++struct mali_buffer *
++A135FMaliUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++void
++A135FMaliUserClient::freeBuffer(struct mali_buffer * b)
++{
++	a135f_mali_unmap(b->address, b->size);
++	b->memory->release();
++	if (b->surface != NULL) {
++		b->surface->release();
++	}
++	bzero(b, sizeof(*b));
++}
++
++/* A handle and GPU addresses for `size` bytes of `memory` from byte `from`; every 4 KB entered. Lock held. */
++struct mali_buffer *
++A135FMaliUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t * handle)
++{
++	struct mali_buffer * b = NULL;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		IOLog("A135FMali: no handles left\n");
++		return NULL;
++	}
++	b->address = a135f_mali_address(size);
++	for (uint64_t offset = 0; offset < size && mapped && b->address != 0; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && a135f_mali_map(b->address + offset, phys);
++	}
++	if (b->address == 0 || !mapped) {
++		if (b->address != 0) {
++			a135f_mali_unmap(b->address, size);
++		}
++		bzero(b, sizeof(*b));
++		IOLog("A135FMali: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	a135f_mali_mapped();
++	OSIncrementAtomic((SInt32 *) &gMaliBuffers);
++	b->size = size;
++	return b;
++}
++
++IOReturn
++A135FMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
++{
++	uint64_t size = round_page_64(request->size);
++	IOBufferMemoryDescriptor * memory;
++	struct mali_buffer * b;
++
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("A135FMali: no memory for a buffer of %llu bytes\n", size);
++		return kIOReturnNoMemory;
++	}
++	b = newBuffer(memory, 0, size, &request->handle);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	b->memory = memory;
++	request->offset = b->address;
++	return kIOReturnSuccess;
++}
++
++/* The pixels of an IOSurface as a buffer: what the window server draws into, and what is shown. */
++IOReturn
++A135FMaliUserClient::surfaceBuffer(struct a135f_surface_req * request)
++{
++	A135FSurface * s = a135f_surface_copy(request->surface);
++	struct mali_buffer * b = NULL;
++	uint64_t size;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	size = round_page_64(s->allocSize);
++	if (s->memory == NULL || size == 0 || size > MALI_BUFFER_MAX) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	request->size = size;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kA135FDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			request->handle = i + 1;
++			s->release();
++			return kIOReturnSuccess;
++		}
++	}
++	b = newBuffer(s->memory, 0, size, &request->handle);
++	if (b == NULL) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	s->memory->retain();
++	b->memory = s->memory;
++	b->surface = s;                         /* keeps the retain a135f_surface_copy() gave */
++	return kIOReturnSuccess;
++}
++
++/*
++ * The GPU does not see the processor's caches: before a job the dirty lines of every surface it
++ * may read go to memory, and after it the stale ones are dropped so that what the GPU wrote is
++ * what the processor (the display's copy, a CPU renderer) reads. Surfaces made of the panel's
++ * own physical memory are mapped write-combined and need none of it.
++ */
++void
++A135FMaliUserClient::syncSurfaces(const uint32_t * handles, uint32_t n)
++{
++	for (uint32_t k = 0; k < n; k++) {
++		struct mali_buffer * b = buffer(handles[k]);
++		uintptr_t va;
++
++		if (b != NULL && b->surface != NULL && OSDynamicCast(IOBufferMemoryDescriptor, b->surface->memory) != NULL &&
++		    (va = b->surface->kernelAddress()) != 0) {
++			a135f_mali_flush((uint64_t) va, b->size);
++		}
++	}
++}
++
++IOReturn
++A135FMaliUserClient::clientClose(void)
++{
++	IOLockLock(gMaliLock);
++	for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL) {
++			freeBuffer(&fBuffers[i]);
++		}
++	}
++	IOLockUnlock(gMaliLock);
++	if (fSubmits != 0) {
++		IOLog("A135FMali: a client goes after %u job chains, %u of them unfinished\n", fSubmits, fFailed);
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++A135FMaliUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++A135FMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gMaliLock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gMaliLock);
++	return ret;
++}
++
++IOReturn
++A135FMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    __unused IOExternalMethodDispatch * dispatch, __unused OSObject * target, __unused void * reference)
++{
++	union {
++		struct drm_gem_close close;
++		struct drm_panfrost_submit submit;
++		struct drm_panfrost_wait_bo wait;
++		struct drm_panfrost_create_bo create;
++		struct drm_panfrost_mmap_bo mmap;
++		struct drm_panfrost_get_param param;
++		struct drm_panfrost_get_bo_offset offset;
++		struct drm_panfrost_madvise madvise;
++		struct a135f_surface_req surface;
++		struct a135f_wait waitseq;
++	} r;
++	size_t size = args->structureInputSize;
++	struct mali_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!a135f_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	IOLockLock(gMaliLock);
++	if (fRequests++ < 16) {
++		IOLog("A135FMali: request %#x, %zu bytes\n", selector, size);
++	}
++	switch (selector) {
++	case kPanfrostGetParam:
++		if (!a135f_mali_parameter(r.param.param, &r.param.value)) {
++			ret = kIOReturnBadArgument;
++		}
++		break;
++	case kPanfrostCreateBO:
++		ret = createBO(&r.create);
++		break;
++	case kPanfrostMmapBO:                   /* the offset is the handle: the program maps client memory of that type */
++		ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.mmap.offset = (uint64_t) r.mmap.handle << 12;
++		break;
++	case kPanfrostGetBOOffset:
++		b = buffer(r.offset.handle);
++		ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.offset.offset = b != NULL ? b->address : 0;
++		break;
++	case kPanfrostSubmit: {
++		uint32_t handles[64], n = 0;
++		uint64_t seq = 0;
++		uint32_t status = 0;
++
++		fSubmits++;
++		gMaliSubmits++;
++		if (r.submit.jc != 0) {
++			n = r.submit.bo_handle_count < 64 ? r.submit.bo_handle_count : 64;
++			if (n != 0 && copyin((user_addr_t) r.submit.bo_handles, handles, n * sizeof(uint32_t)) != 0) {
++				n = 0;
++			}
++			syncSurfaces(handles, n);
++			seq = a135f_mali_run(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS, &status);
++			syncSurfaces(handles, n);
++			if (status != 0) {
++				fFailed++;
++				gMaliFailed++;
++			}
++		}
++		r.submit.jc = seq;
++		break;
++	}
++	case kA135FSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
++	case kA135FWait:
++		break;
++	case kPanfrostWaitBO:                   /* every job has finished before its submission returned */
++		ret = buffer(r.wait.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		break;
++	case kPanfrostMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kDrmGemClose:
++		b = buffer(r.close.handle);
++		if (b != NULL) {
++			freeBuffer(b);
++		} else {
++			ret = kIOReturnNotFound;
++		}
++		break;
++	default:
++		IOLog("A135FMali: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gMaliLock);
++
++	if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++		memcpy(args->structureOutput, &r, size);
++		args->structureOutputSize = (uint32_t) size;
++	}
++	return ret;
++}
++#endif /* A135F */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 003cda8..826a950 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/A135FKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/A135FWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/A135FSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/A135FFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/A135FMali.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/A135FBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/A135FHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
