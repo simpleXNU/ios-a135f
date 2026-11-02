@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the A135F bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo a135f-root-tweaks.py MOUNTED_ROOT
+  sudo a135f-root-tweaks.py MOUNTED_ROOT [--gl DIR]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -23,6 +23,8 @@ screen (image versions v8-v14 in NOTES.md):
                   kills), no cloud-configuration UI
   Setup           skipped: SetupDone, SetupFinishedAllSteps, SetupVersion 11,
                   mini-buddy flags off
+  gpu (--gl DIR)  the Mali userland built by userland/build.sh (DIR = userland/out): its dylibs go to
+                  /usr/local/lib/a135f, its test programs to /usr/local/bin (boot with a135f_mali=1 a135f_gl=1)
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
@@ -122,10 +124,41 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def gpu(root, src):
+    """Install userland/out: *.dylib -> /usr/local/lib/a135f, everything else executable -> /usr/local/bin."""
+    if not os.path.isdir(src):
+        sys.exit('--gl: %s is not a directory (run userland/build.sh first)' % src)
+    lib = os.path.join(root, 'usr/local/lib/a135f')
+    bin_ = os.path.join(root, 'usr/local/bin')
+    for d in (lib, bin_):
+        os.makedirs(d, exist_ok=True)
+        os.chown(d, 0, 0)
+        os.chmod(d, 0o755)
+    for name in sorted(os.listdir(src)):
+        path = os.path.join(src, name)
+        if not os.path.isfile(path):
+            continue
+        dst = os.path.join(lib if name.endswith('.dylib') else bin_, name)
+        shutil.copyfile(path, dst)
+        os.chown(dst, 0, 0)
+        os.chmod(dst, 0o755)
+        print('gpu:', os.path.relpath(dst, root))
+
+
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = sys.argv[1:]
+    gl = None
+    if '--gl' in args:
+        i = args.index('--gl')
+        gl = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+        if gl is None:
+            sys.exit(__doc__)
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root = sys.argv[1]
+    root = args[0]
+    if gl:
+        gpu(root, gl)
     launchd(root)
     containers(root)
     activation(root)

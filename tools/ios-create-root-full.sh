@@ -21,6 +21,7 @@
 #   --verify         check that the sparse image expands back to exactly the raw image (slow)
 #   --extract-only   stop after step 3 (useful to check the parsing)
 #   --no-ipsw        do not use the `ipsw` tool, extract with unzip
+#   --gl DIR         also install the Mali userland (DIR = userland/out, from userland/build.sh) into the root
 #
 # Needs: python3, curl (URL only), unzip, sudo, apfs-fuse, mkfs.hfsplus/fsck.hfsplus (hfsprogs), rsync,
 #        img2simg (android-sdk-libsparse-utils); `ipsw` (github.com/blacktop/ipsw) is optional but used when present.
@@ -36,6 +37,7 @@ work=""
 size="16G"
 copy_to=""
 keep_dmgs=0 no_raw=0 verify=0 extract_only=0 use_ipsw=1
+gl_dir=""
 while [[ $# -gt 0 ]]; do
 	case $1 in
 	--out) out=$2; shift 2 ;;
@@ -47,12 +49,13 @@ while [[ $# -gt 0 ]]; do
 	--verify) verify=1; shift ;;
 	--extract-only) extract_only=1; shift ;;
 	--no-ipsw) use_ipsw=0; shift ;;
-	-h | --help) sed -n '2,29p' "$0"; exit 0 ;;
+	--gl) gl_dir=$(realpath "$2"); shift 2 ;;
+	-h | --help) sed -n '2,30p' "$0"; exit 0 ;;
 	-*) die "unknown option $1 (see --help)" ;;
 	*) [[ -z $src ]] || die "only one IPSW argument allowed"; src=$1; shift ;;
 	esac
 done
-[[ -n $src ]] || { sed -n '2,29p' "$0"; exit 2; }
+[[ -n $src ]] || { sed -n '2,30p' "$0"; exit 2; }
 
 mkdir -p "$out"
 out=$(realpath "$out")
@@ -188,7 +191,7 @@ else
 	cleanup_mnt() { mountpoint -q "$mnt" && sudo umount "$mnt" || true; rmdir "$mnt" 2>/dev/null || true; }
 	trap cleanup_mnt EXIT
 	sudo mount -t hfsplus -o loop,force,rw "$img" "$mnt"
-	sudo python3 "$here/a135f-root-tweaks.py" "$mnt"
+	sudo python3 "$here/a135f-root-tweaks.py" "$mnt" ${gl_dir:+--gl "$gl_dir"}
 	sync
 	sudo umount "$mnt"
 	rmdir "$mnt"
