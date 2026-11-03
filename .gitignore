@@ -16,3 +16,8 @@ kernel.*
 *out/
 */*/out/
 ios-root-*
+obj/*
+obj/
+userland/obj/*
+userland/obj/
+userland/out/
