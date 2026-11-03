@@ -53,7 +53,7 @@ tools/ios-create-root-full.sh <url_to_ipsw or path/to/ipsw> --gl userland/out
    ```sh
    python3 tools/mkadt.py shim/out/a135f.adt --touch-fw $PWD/td4375_a13_boe.bin   # vendor TCM image you load on Linux
    python3 tools/mkpayload.py path/to/kernel shim/out/a135f.adt shim/out/payload.bin \
-       --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=mmcroot0 mmcrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 a135f_fb_noconsole=1 a135f_fb_hz=60 a135f_mali=1'
+       --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=mmcroot0 mmcrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 a135f_fb_noconsole=1 a135f_fb_hz=60 a135f_mali=1 a135f_gl=1'
    shim/build.sh out/payload.bin      # needs aarch64-linux-gnu-gcc/binutils; -> shim/out/uniloader-blobs/{Image,ramdisk}
    ```
 2. **Logs:** the kernel keeps a 4 MiB console ring at the end of `userdata`; read it from recovery/pmOS with
