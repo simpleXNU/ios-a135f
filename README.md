@@ -36,18 +36,24 @@
 
 1. **Kernel:** fork the repo and run the `xnu` workflow (`gh workflow run xnu.yml -R YOU/ios-a135f`), then
    `gh run download RUN_ID -n kernel-development-a135f -D xnu/out`. Expect compile errors on the first runs (`keep_going` collects them all).
-2. 
+
+2. build userland GL blobs
+  Refer to ```userland/BUILD-LINUX.md```
+
+ 
+
+3. 
 ```
-tools/ios-create-root-full.sh <url_to_ipsw or path/to/ipsw>
+tools/ios-create-root-full.sh <url_to_ipsw or path/to/ipsw> --gl userland/out
 ```
 
 
 # Todo: REWRITE
 1. **Payload and blobs:**
    ```sh
-   python3 tools/mkadt.py shim/out/a135f.adt --touch-fw /path/to/td4375_a13_boe.bin   # vendor TCM image you load on Linux
-   python3 tools/mkpayload.py xnu/out/kernel.development.a135f shim/out/a135f.adt shim/out/payload.bin \
-       --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=mmcroot0 mmcrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 a135f_fb_noconsole=1 a135f_fb_hz=30'
+   python3 tools/mkadt.py shim/out/a135f.adt --touch-fw $PWD/td4375_a13_boe.bin   # vendor TCM image you load on Linux
+   python3 tools/mkpayload.py path/to/kernel shim/out/a135f.adt shim/out/payload.bin \
+       --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=mmcroot0 mmcrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 a135f_fb_noconsole=1 a135f_fb_hz=60 a135f_mali=1'
    shim/build.sh out/payload.bin      # needs aarch64-linux-gnu-gcc/binutils; -> shim/out/uniloader-blobs/{Image,ramdisk}
    ```
 2. **Logs:** the kernel keeps a 4 MiB console ring at the end of `userdata`; read it from recovery/pmOS with
