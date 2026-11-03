@@ -8,6 +8,9 @@
 #   SDK=/path/iPhoneOS16.5.sdk   (default $THEOS/sdks/iPhoneOS16.5.sdk, or `xcrun --sdk iphoneos --show-sdk-path` on a Mac)
 #   CC="clang -target arm64-apple-ios16.0"   (default; on a Mac `xcrun -sdk iphoneos clang -arch arm64` works too)
 #   LDID=ldid                    signs the outputs ad hoc when present (the AMFI stand-in only needs a signature to exist)
+
+source /home/schoosh/ios-toolchain/env.sh
+
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
 if [ -z "$SDK" ]; then
