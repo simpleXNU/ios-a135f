@@ -34,14 +34,14 @@ if [ "${USE_CCTOOLS:-0}" = 1 ]; then
 fi
 
 cat > "$T/env.sh" <<ENV
-chmod a+x $T/env.sh
 export IOS_TOOLCHAIN="$T"
 export SDK="$T/sdk/iPhoneOS16.5.sdk"
 export PATH="$T/bin:\$PATH"
-export CC="clang -target arm64-apple-ios16.0 $LD"
-export CXX="clang++ -target arm64-apple-ios16.0 $LD"
+export IOS_CC="clang -target arm64-apple-ios16.0 $LD"
+export IOS_CXX="clang++ -target arm64-apple-ios16.0 $LD"
 export INSTALL_NAME_TOOL="$INT"
 export NM=llvm-nm
 export LDID="${LDID:-\$HOME/ios-a135f/binaries/ldid}"
 ENV
+chmod a+x $T/env.sh
 echo "setup: done. Next:  source $T/env.sh"
