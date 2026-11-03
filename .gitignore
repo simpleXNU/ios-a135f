@@ -21,3 +21,4 @@ obj/
 userland/obj/*
 userland/obj/
 userland/out/
+userland/mesa/build
