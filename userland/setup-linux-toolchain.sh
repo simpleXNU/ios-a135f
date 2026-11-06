@@ -43,5 +43,4 @@ export INSTALL_NAME_TOOL="$INT"
 export NM=llvm-nm
 export LDID="${LDID:-\$HOME/ios-a135f/binaries/ldid}"
 ENV
-chmod a+x $T/env.sh
 echo "setup: done. Next:  source $T/env.sh"

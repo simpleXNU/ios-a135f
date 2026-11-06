@@ -7,7 +7,7 @@
 # Mesa's own host tool mesa_clc (LLVM + libclc + SPIRV-Tools + SPIRV-LLVM-Translator on the BUILD machine):
 # step 1 builds it natively, step 2 cross-builds against it.
 #
-#   SDK, CC, CXX as for ../build.sh        DRIVERS=softpipe,panfrost (default)
+#   SDK, IOS_CC, IOS_CXX as for ../build.sh        DRIVERS=softpipe,panfrost (default)
 #
 # NOT verified: apply-panfrost-darwin.py was written without Mesa's source at hand (it names every edit it
 # cannot place), and no Mesa build was run for this. Read mesa/README-mesa.txt first.
@@ -20,8 +20,8 @@ if [ -z "$SDK" ]; then
 	if command -v xcrun >/dev/null 2>&1; then SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 	else SDK=${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk; fi
 fi
-CC=${CC:-clang -target arm64-apple-ios16.0}
-CXX=${CXX:-clang++ -target arm64-apple-ios16.0}
+CC=${IOS_CC:-clang -target arm64-apple-ios16.0}
+CXX=${IOS_CXX:-clang++ -target arm64-apple-ios16.0}
 DRIVERS=${DRIVERS:-softpipe,panfrost}
 mkdir -p "$B/out" "$HERE/out"; cd "$B"
 

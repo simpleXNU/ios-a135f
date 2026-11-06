@@ -4,7 +4,7 @@
  * (liba135f.gl.dylib: src/eagl.c on Mesa's panfrost) which puts itself behind EAGLContext, and
  * CoreAnimation, finding no Metal device, draws with its OpenGL ES renderer on the GPU instead of its
  * CPU one. Without the service, or with boot-arg a135f_gl=0 given after it, nothing is loaded and the
- * CPU renderer stays. This needs no addresses in the dyld shared cache.
+ * CPU renderer stays. Unlike HakiOS's inject.c this needs no addresses in the dyld shared cache.
  */
 #include <dlfcn.h>
 #include <stdio.h>

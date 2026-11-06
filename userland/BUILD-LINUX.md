@@ -15,17 +15,21 @@ Do A and B first; B alone is enough to prove the GPU works (`mali_test`).
 
 ## A. The toolchain (once)
 
+**Fast path (default, about a minute):** clang + lld + the iOS SDK; no ld64 build. `ldid` is not in apt: point `LDID` at your own binary
+(`env.sh` defaults it to `~/ios-a135f/binaries/ldid`). For the slower ld64 route run `USE_CCTOOLS=1 ./setup-linux-toolchain.sh`
+(needs `libblocksruntime-dev libdispatch-dev`, which the script installs in that mode).
+
 Debian 12+ / Ubuntu 22.04+ (other distros: install the equivalents of the packages in the script).
 
 ```bash
 cd userland
 ./setup-linux-toolchain.sh          # apt packages, iOS 16.5 SDK (theos/sdks), apple-libtapi, cctools-port (ld64), ldid
-source ~/ios-toolchain/env.sh       # sets SDK, CC, CXX, INSTALL_NAME_TOOL, NM, PATH   (every new shell)
+source ~/ios-toolchain/env.sh       # sets SDK, IOS_CC, IOS_CXX, INSTALL_NAME_TOOL, NM, PATH   (every new shell)
 ```
 
 What it does, if you would rather do it by hand:
 
-1. `sudo apt install clang lld llvm cmake ninja-build make git curl xz-utils patch pkg-config python3 python3-venv python3-mako python3-yaml bison flex libssl-dev libxml2-dev uuid-dev zlib1g-dev libedit-dev ldid`
+1. `sudo apt install clang lld llvm cmake ninja-build make git curl xz-utils patch pkg-config python3 python3-venv python3-mako python3-yaml bison flex libssl-dev libxml2-dev uuid-dev zlib1g-dev libedit-dev `
 2. `git clone --depth=1 https://github.com/theos/sdks` and copy `iPhoneOS16.5.sdk` to `~/ios-toolchain/sdk/`
 3. build `tpoechtrager/apple-libtapi` (`INSTALLPREFIX=~/ios-toolchain ./build.sh && ./install.sh`), then
    `tpoechtrager/cctools-port` (`cd cctools && ./configure --prefix=~/ios-toolchain --with-libtapi=~/ios-toolchain --target=aarch64-apple-darwin && make -j && make install`)
@@ -35,11 +39,11 @@ Check it works:
 
 ```bash
 echo 'int main(void){return 0;}' > /tmp/t.c
-$CC -isysroot $SDK /tmp/t.c -o /tmp/t && file /tmp/t     # "Mach-O 64-bit executable arm64"
+$IOS_CC -isysroot $SDK /tmp/t.c -o /tmp/t && file /tmp/t     # "Mach-O 64-bit executable arm64"
 ```
 
 If the linker step fails with `.tbd` / "library not found" errors, the SDK path is wrong or libtapi was not found when
-cctools-port was configured. A fallback is lld: `export CC="clang -target arm64-apple-ios16.0 -fuse-ld=lld"`.
+cctools-port was configured. A fallback is lld: `export IOS_CC="clang -target arm64-apple-ios16.0 -fuse-ld=lld"`.
 
 ## B. The small programs
 
