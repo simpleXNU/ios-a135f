@@ -8,7 +8,7 @@ index c6d7c92..9a78378 100644
   */
 +#if defined(ARM64_BOARD_CONFIG_A135F)
 +/*
-+ * Bring-up aid: the sysctl kern.exec_inject holds "LIBRARY NAME NAME ... [; LIBRARY NAME ...]";
++ * Bring-up aid (from HakiOS): the sysctl kern.exec_inject holds "LIBRARY NAME NAME ... [; LIBRARY NAME ...]";
 + * every program whose file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY in its
 + * environment, so that dyld loads our library into it (launchd refuses DYLD_ variables from a job
 + * description, which is why the kernel adds this one). A program named in several groups gets all of the

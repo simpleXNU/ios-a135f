@@ -21,9 +21,9 @@ index 0000000..c82fa2d
 + * a135f_mali=1 (a GPU register read with its power domain or clock off hangs the bus, so nothing
 + * here runs by default).
 + *
-+ * Panfrost/Bifrost driver for Mali-G52 (Exynos850)
++ * Ported from the MT6768 driver (hakios.mali.c / redwood_mali.c, Infinix Hot 20, Mali-G52 MC2):
 + * everything from the GPU's soft reset on is Bifrost's and is the same. Only the way the block
-+ * gets power and a clock differs, done here like Linux does it:
++ * gets power and a clock differs, and is done here the way Linux does it for the Exynos850:
 + *
 + *   1  CMU_TOP: the "g3d switch" clock (mux, divider, gate), drivers/clk/samsung/clk-exynos850.c
 + *   2  PMU: the G3D power domain (drivers/soc/samsung/pm_domains.c: PD_G3D at PMU + 0x1d00,
@@ -34,8 +34,8 @@ index 0000000..c82fa2d
 + *   5  one job -- write a value into memory -- in identity mode, then
 + *   6  the same job through the GPU's own page tables
 + *
-+ * GPU supplies are left as dummy regs here, as i turn them on manually in uniLoader
-+ * due to it being reliable and simple to do, and is an easy workaround for no reg control present.
++ * The GPU's supply (buck2, "mali-supply") is a dummy regulator here: uniLoader leaves it on.
++ * No interrupts: jobs are polled (the DT has job/mmu/gpu SPIs 126/127/125 for a later driver).
 + * Jobs run to their end before the submit call returns (one address space, one job at a time).
 + *
 + * sysctl kern.a135f_mali says how far it got: 6 means every step worked.

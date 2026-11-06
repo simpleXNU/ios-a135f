@@ -13,9 +13,9 @@ index 0000000..a1d221b
 + * with the request's number as the selector and its structure passed in and back. What Linux does
 + * with mmap() on the device is the client memory of the type that is the buffer's handle.
 + *
-+ * IOSurfaces are the built-in A135FSurface; jobs run to their end inside the submit call (a135f_mali_run),
-+ * so waits are already satisfied; the CPU's caches are cleaned/invalidated around a job for
-+ * surface-backed buffers (the GPU is not coherent).
++ * Ported from HakiosMali (MT6768). Differences: IOSurfaces are the built-in A135FSurface; jobs run
++ * to their end inside the submit call (a135f_mali_run), so waits are already satisfied; the CPU's
++ * caches are cleaned/invalidated around a job for surface-backed buffers (the GPU is not coherent).
 + */
 +#include <pexpert/arm64/board_config.h>
 +

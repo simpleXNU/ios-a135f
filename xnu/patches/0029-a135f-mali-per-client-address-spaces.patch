@@ -1,0 +1,591 @@
+diff --git a/bsd/dev/a135f_mali.c b/bsd/dev/a135f_mali.c
+index c82fa2d..2b4a179 100644
+--- a/bsd/dev/a135f_mali.c
++++ b/bsd/dev/a135f_mali.c
+@@ -57,6 +57,17 @@ uint32_t a135f_mali_submit(uint64_t chain, bool fragment);
+ uint64_t a135f_mali_run(uint64_t chain, bool fragment, uint32_t *status);
+ void a135f_mali_tag(uint64_t address, uint32_t kind);
+ void a135f_mali_flush(uint64_t va, uint64_t len);
++struct mali_vm;
++struct mali_vm *a135f_mali_vm_create(void);
++void a135f_mali_vm_destroy(struct mali_vm *vm);
++bool a135f_mali_vm_map(struct mali_vm *vm, uint64_t iova, uint64_t phys, bool writable);
++void a135f_mali_vm_mapped(struct mali_vm *vm);
++void a135f_mali_vm_unmap(struct mali_vm *vm, uint64_t iova, uint64_t size);
++uint32_t a135f_mali_vm_submit(struct mali_vm *vm, uint64_t chain, bool fragment);
++bool a135f_mali_info_reg(uint32_t offset, uint32_t *value);
++uint64_t a135f_mali_faults(void);
++uint64_t a135f_mali_resets(void);
++void a135f_mali_reset_device(void);
+ 
+ #define PMU_PA          0x11860000u
+ #define PMU_PD_G3D      0x1d00          /* CONF; STATUS at +4 */
+@@ -284,17 +295,26 @@ run_write_job(vm_offset_t page, uint64_t gpu, const char *what)
+ 	return ok;
+ }
+ 
++#define AS_REG(as, off)     (AS0 + ((as) << 6) + (off))
++#define GPU_AS_PRESENT_REG  0x018
++
++static void
++as_update(uint32_t as, uint64_t transtab, uint32_t transcfg)
++{
++	wr(mali, AS_REG(as, AS_TRANSTAB_LO), (uint32_t)transtab);
++	wr(mali, AS_REG(as, AS_TRANSTAB_HI), (uint32_t)(transtab >> 32));
++	wr(mali, AS_REG(as, AS_TRANSCFG_LO), transcfg);
++	wr(mali, AS_REG(as, AS_TRANSCFG_HI), 0);
++	wr(mali, AS_REG(as, AS_MEMATTR_LO), 0x88888888u);
++	wr(mali, AS_REG(as, AS_MEMATTR_HI), 0x88888888u);
++	wr(mali, AS_REG(as, AS_COMMAND), 1);    /* update */
++	(void)wait_for(mali, AS_REG(as, AS_STATUS), 1, 0, 50);
++}
++
+ static void
+ as0_update(uint64_t transtab, uint32_t transcfg)
+ {
+-	wr(mali, AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
+-	wr(mali, AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
+-	wr(mali, AS0 + AS_TRANSCFG_LO, transcfg);
+-	wr(mali, AS0 + AS_TRANSCFG_HI, 0);
+-	wr(mali, AS0 + AS_MEMATTR_LO, 0x88888888u);
+-	wr(mali, AS0 + AS_MEMATTR_HI, 0x88888888u);
+-	wr(mali, AS0 + AS_COMMAND, 1);          /* update */
+-	(void)wait_for(mali, AS0 + AS_STATUS, 1, 0, 50);
++	as_update(0, transtab, transcfg);
+ }
+ 
+ /* ---- the GPU's own page tables: AArch64 stage 1, 4 KB pages, 35 address bits, three levels ---- */
+@@ -310,8 +330,29 @@ as0_update(uint64_t transtab, uint32_t transcfg)
+ static uint32_t mali_fastmap = 1;
+ #define TRANSCFG_AARCH64_4K (mali_fastmap ? TRANSCFG_WALK_NC : TRANSCFG_WALK_WB)
+ 
+-static uint64_t *pt_top;
+-static uint64_t pt_top_phys;
++/*
++ * One GPU address space: its three levels of tables and the address space (AS register block) it is
++ * programmed into. The kernel's own (first jobs, the A135FMali service) is legacy_vm in AS0; each
++ * NativeMali client gets one of the others. Tables are 4 KB entries in whole kernel pages; their own
++ * virtual addresses are kept beside them (no phystokv: the entries hold physical addresses only).
++ */
++struct pt_shadow {
++	uint64_t *bottom[512];
++};
++
++struct mali_vm {
++	uint32_t as;
++	bool live;
++	uint64_t *top;                          /* 32 entries */
++	uint64_t top_phys;
++	uint64_t *mid[32];                      /* 512 entries each */
++	struct pt_shadow *shadow[32];           /* the bottom tables of each */
++};
++
++#define MALI_MAX_AS 16
++static struct mali_vm legacy_vm;
++static struct mali_vm *vm_table[MALI_MAX_AS];       /* every live context, by address space */
++static uint32_t as_present;
+ 
+ static uint64_t *
+ pt_page(uint64_t *phys)
+@@ -326,17 +367,6 @@ pt_page(uint64_t *phys)
+ 	return (uint64_t *)page;
+ }
+ 
+-/*
+- * The tables' own virtual addresses are kept beside them (no phystokv: the entries hold physical
+- * addresses only): the three levels are pt_top (32 entries), pt_mid_table[t] (512) and the bottom
+- * tables, whose pointers sit in pt_mid_shadow[t]->bottom[m].
+- */
+-struct pt_shadow {
+-	uint64_t *bottom[512];
+-};
+-static uint64_t *pt_mid_table[32];
+-static struct pt_shadow *pt_mid_shadow[32];
+-
+ static struct pt_shadow *
+ pt_shadow_alloc(void)
+ {
+@@ -350,56 +380,88 @@ pt_shadow_alloc(void)
+ 
+ /* The bottom-level entry for GPU address `gpu`; with `create`, tables are made on the way. mali_lock held. */
+ static uint64_t *
+-pt_entry(uint64_t gpu, bool create)
++pt_entry(struct mali_vm *vm, uint64_t gpu, bool create)
+ {
+ 	uint32_t t = (uint32_t)((gpu >> 30) & 31), m = (uint32_t)((gpu >> 21) & 511), b = (uint32_t)((gpu >> 12) & 511);
+ 	uint64_t phys;
+ 	uint64_t *table;
+ 
+-	if (pt_top == NULL) {
+-		if (!create || (pt_top = pt_page(&pt_top_phys)) == NULL) {
++	if (vm->top == NULL) {
++		if (!create || (vm->top = pt_page(&vm->top_phys)) == NULL) {
+ 			return NULL;
+ 		}
+ 	}
+-	if (pt_mid_table[t] == NULL) {
++	if (vm->mid[t] == NULL) {
+ 		struct pt_shadow *shadow;
+ 
+ 		if (!create || (table = pt_page(&phys)) == NULL) {
+ 			return NULL;
+ 		}
+ 		if ((shadow = pt_shadow_alloc()) == NULL) {
++			kmem_free(kernel_map, (vm_offset_t)table, PAGE_SIZE);
+ 			return NULL;
+ 		}
+-		pt_mid_table[t] = table;
+-		pt_mid_shadow[t] = shadow;
+-		pt_top[t] = phys | PTE_TABLE;
+-		flush_va((vm_offset_t)&pt_top[t], sizeof(pt_top[t]));
++		vm->mid[t] = table;
++		vm->shadow[t] = shadow;
++		vm->top[t] = phys | PTE_TABLE;
++		flush_va((vm_offset_t)&vm->top[t], sizeof(vm->top[t]));
+ 	}
+-	if (pt_mid_shadow[t]->bottom[m] == NULL) {
++	if (vm->shadow[t]->bottom[m] == NULL) {
+ 		if (!create || (table = pt_page(&phys)) == NULL) {
+ 			return NULL;
+ 		}
+-		pt_mid_shadow[t]->bottom[m] = table;
+-		pt_mid_table[t][m] = phys | PTE_TABLE;
+-		flush_va((vm_offset_t)&pt_mid_table[t][m], sizeof(pt_mid_table[t][m]));
++		vm->shadow[t]->bottom[m] = table;
++		vm->mid[t][m] = phys | PTE_TABLE;
++		flush_va((vm_offset_t)&vm->mid[t][m], sizeof(vm->mid[t][m]));
+ 	}
+-	return &pt_mid_shadow[t]->bottom[m][b];
++	return &vm->shadow[t]->bottom[m][b];
+ }
+ 
++#define PTE_RDONLY          (1ull << 7)
++
+ /* One 4 KB page at GPU address `gpu` (mali_lock held, or before anyone else runs). */
+ static bool
+-map_page(uint64_t gpu, uint64_t phys)
++map_page_perm(struct mali_vm *vm, uint64_t gpu, uint64_t phys, bool writable)
+ {
+-	uint64_t *entry = pt_entry(gpu, true);
++	uint64_t *entry = pt_entry(vm, gpu, true);
+ 
+ 	if (entry == NULL) {
+ 		return false;
+ 	}
+-	*entry = (phys & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE;
++	*entry = (phys & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE | (writable ? 0 : PTE_RDONLY);
+ 	flush_va((vm_offset_t)entry, sizeof(*entry));
+ 	return true;
+ }
+ 
++static bool
++map_page(struct mali_vm *vm, uint64_t gpu, uint64_t phys)
++{
++	return map_page_perm(vm, gpu, phys, true);
++}
++
++/* Give every page of a context's tables back. The address space must not be in use. mali_lock held. */
++static void
++vm_free_tables(struct mali_vm *vm)
++{
++	for (uint32_t t = 0; t < 32; t++) {
++		if (vm->shadow[t] != NULL) {
++			for (uint32_t m = 0; m < 512; m++) {
++				if (vm->shadow[t]->bottom[m] != NULL) {
++					kmem_free(kernel_map, (vm_offset_t)vm->shadow[t]->bottom[m], PAGE_SIZE);
++				}
++			}
++			kmem_free(kernel_map, (vm_offset_t)vm->shadow[t], PAGE_SIZE);
++		}
++		if (vm->mid[t] != NULL) {
++			kmem_free(kernel_map, (vm_offset_t)vm->mid[t], PAGE_SIZE);
++		}
++	}
++	if (vm->top != NULL) {
++		kmem_free(kernel_map, (vm_offset_t)vm->top, PAGE_SIZE);
++	}
++	bzero(vm, sizeof(*vm));
++}
++
+ #define FIRST_JOB_GPU       0x00100000ull
+ 
+ static unsigned
+@@ -415,8 +477,8 @@ first_jobs(void)
+ 	as0_update(0, 2);                       /* identity: a GPU address is the physical one */
+ 	if (run_write_job(page, va_to_pa(page), "first job, identity mode")) {
+ 		done = 1;
+-		if (map_page(FIRST_JOB_GPU, va_to_pa(page))) {
+-			as0_update(pt_top_phys, TRANSCFG_AARCH64_4K);
++		if (map_page(&legacy_vm, FIRST_JOB_GPU, va_to_pa(page))) {
++			as0_update(legacy_vm.top_phys, TRANSCFG_AARCH64_4K);
+ 			if (run_write_job(page, FIRST_JOB_GPU, "second job, through the GPU's page tables")) {
+ 				done = 2;
+ 			}
+@@ -484,9 +546,14 @@ mali_up(void)
+ 	reached = 4;
+ 	printf("a135f mali: GPU_ID %#x (Mali-G52 r%up%u): all powered\n", gpu_id, (gpu_id >> 12) & 0xf, (gpu_id >> 4) & 0xff);
+ 
++	as_present = rd(mali, GPU_AS_PRESENT_REG);
++	printf("a135f mali: address spaces present %#x\n", as_present);
++	legacy_vm.as = 0;
+ 	switch (first_jobs()) {
+ 	case 2:
+ 		reached = 6;
++		legacy_vm.live = true;
++		vm_table[0] = &legacy_vm;
+ 		break;
+ 	case 1:
+ 		reached = 5;
+@@ -504,32 +571,6 @@ static LCK_MTX_DECLARE(mali_job_lock, &mali_lock_group);
+ static int mali_wait_event;
+ static LCK_MTX_DECLARE(mali_wait_lock, &mali_lock_group);
+ 
+-static bool
+-wait_job(uint32_t at, uint32_t mask, uint32_t want, uint32_t ms)
+-{
+-	uint64_t deadline;
+-
+-	for (int i = 0; i < 20; i++) {
+-		if ((rd(mali, at) & mask) == want) {
+-			return true;
+-		}
+-		delay(10);
+-	}
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	while (mach_absolute_time() < deadline) {
+-		uint64_t nap;
+-
+-		if ((rd(mali, at) & mask) == want) {
+-			return true;
+-		}
+-		clock_interval_to_deadline(200, NSEC_PER_USEC, &nap);
+-		lck_mtx_lock(&mali_wait_lock);
+-		(void)lck_mtx_sleep_deadline(&mali_wait_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_wait_event, THREAD_UNINT, nap);
+-		lck_mtx_unlock(&mali_wait_lock);
+-	}
+-	return (rd(mali, at) & mask) == want;
+-}
+-
+ #define GPU_ADDRESS_FIRST   0x01000000ull
+ #define GPU_ADDRESS_END     (1ull << 35)
+ static uint64_t next_address = GPU_ADDRESS_FIRST;
+@@ -621,37 +662,58 @@ a135f_mali_tag(__unused uint64_t address, __unused uint32_t kind)
+ {
+ }
+ 
+-bool
+-a135f_mali_map(uint64_t gpu, uint64_t phys)
+-{
+-	bool done;
+-
+-	lck_mtx_lock(&mali_lock);
+-	done = map_page(gpu, phys);
+-	lck_mtx_unlock(&mali_lock);
+-	return done;
+-}
++static uint64_t gpu_faults, gpu_resets;
++static struct mali_vm vm_pool[MALI_MAX_AS];
+ 
+-void
+-a135f_mali_unmap(uint64_t gpu, uint64_t size)
++/* Entries out of a context's tables, then the MMU told: a job may not be running (job lock), mali_lock inside. */
++static void
++vm_unmap_common(struct mali_vm *vm, uint64_t gpu, uint64_t size)
+ {
++	lck_mtx_lock(&mali_job_lock);
+ 	lck_mtx_lock(&mali_lock);
+ 	for (uint64_t at = gpu; at < gpu + size; at += 4096) {
+-		uint64_t *entry = pt_entry(at, false);
++		uint64_t *entry = pt_entry(vm, at, false);
+ 
+ 		if (entry != NULL) {
+ 			*entry = 0;
+ 			flush_va((vm_offset_t)entry, sizeof(*entry));
+ 		}
+ 	}
++	as_update(vm->as, vm->top_phys, TRANSCFG_AARCH64_4K);   /* an entry taken out: the MMU may hold it */
+ 	lck_mtx_unlock(&mali_lock);
+-	lck_mtx_lock(&mali_job_lock);           /* an entry taken out: the MMU may hold it */
++	lck_mtx_unlock(&mali_job_lock);
++}
++
++static void
++vm_resync(struct mali_vm *vm)
++{
++	if (mali_fastmap) {
++		return;
++	}
++	lck_mtx_lock(&mali_job_lock);
+ 	lck_mtx_lock(&mali_lock);
+-	as0_update(pt_top_phys, TRANSCFG_AARCH64_4K);
++	as_update(vm->as, vm->top_phys, TRANSCFG_AARCH64_4K);
+ 	lck_mtx_unlock(&mali_lock);
+ 	lck_mtx_unlock(&mali_job_lock);
+ }
+ 
++bool
++a135f_mali_map(uint64_t gpu, uint64_t phys)
++{
++	bool done;
++
++	lck_mtx_lock(&mali_lock);
++	done = map_page(&legacy_vm, gpu, phys);
++	lck_mtx_unlock(&mali_lock);
++	return done;
++}
++
++void
++a135f_mali_unmap(uint64_t gpu, uint64_t size)
++{
++	vm_unmap_common(&legacy_vm, gpu, size);
++}
++
+ /*
+  * After entries were added: with the walks cached (a135f_mali_fastmap=0) the MMU is set up again from the
+  * top -- an UPDATE drops what it cached; a region lock and table flush faulted on the MT6768. With the
+@@ -660,61 +722,212 @@ a135f_mali_unmap(uint64_t gpu, uint64_t size)
+ void
+ a135f_mali_mapped(void)
+ {
+-	if (mali_fastmap) {
+-		return;
++	vm_resync(&legacy_vm);
++}
++
++/* Soft reset, the cores powered again, every live address space programmed again. Both locks held. */
++static void
++device_recover(void)
++{
++	wr(mali, GPU_INT_CLEAR, 0xffffffffu);
++	wr(mali, GPU_CMD, 1);                   /* soft reset, then everything back as it was */
++	(void)wait_for(mali, GPU_INT_RAWSTAT, IRQ_RESET_COMPLETED, IRQ_RESET_COMPLETED, 100);
++	wr(mali, L2_PWRON, rd(mali, L2_PRESENT));
++	wr(mali, TILER_PWRON, rd(mali, TILER_PRESENT));
++	wr(mali, SHADER_PWRON, shader_mask);
++	(void)wait_for(mali, SHADER_READY, shader_mask, shader_mask, 50);
++	for (uint32_t as = 0; as < MALI_MAX_AS; as++) {
++		if (vm_table[as] != NULL && vm_table[as]->top != NULL) {
++			as_update(as, vm_table[as]->top_phys, TRANSCFG_AARCH64_4K);
++		}
+ 	}
+-	lck_mtx_lock(&mali_job_lock);
+-	lck_mtx_lock(&mali_lock);
+-	as0_update(pt_top_phys, TRANSCFG_AARCH64_4K);
+-	lck_mtx_unlock(&mali_lock);
+-	lck_mtx_unlock(&mali_job_lock);
++	wr(mali, MMU_INT_CLEAR, 0xffffffffu);
++	gpu_resets++;
++}
++
++/* Wait until any bit of `mask` is set in a register, polling then sleeping a little; true if one was. */
++static bool
++wait_any(uint32_t at, uint32_t mask, uint32_t ms)
++{
++	uint64_t deadline;
++
++	for (int i = 0; i < 20; i++) {
++		if ((rd(mali, at) & mask) != 0) {
++			return true;
++		}
++		delay(10);
++	}
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	while (mach_absolute_time() < deadline) {
++		uint64_t nap;
++
++		if ((rd(mali, at) & mask) != 0) {
++			return true;
++		}
++		clock_interval_to_deadline(200, NSEC_PER_USEC, &nap);
++		lck_mtx_lock(&mali_wait_lock);
++		(void)lck_mtx_sleep_deadline(&mali_wait_lock, LCK_SLEEP_DEFAULT, (event_t)&mali_wait_event, THREAD_UNINT, nap);
++		lck_mtx_unlock(&mali_wait_lock);
++	}
++	return (rd(mali, at) & mask) != 0;
+ }
+ 
+ /*
+- * One job chain from GPU address `chain`, run to its end before this returns: fragment jobs on
+- * slot 0, the rest on slot 1. 0 when it finished; else the slot's status, a fault, or 0xff for
+- * no answer within a second -- and then the GPU is reset, so the next job finds it working.
++ * One job chain from GPU address `chain` in address space `as`, run to its end before this returns:
++ * fragment jobs on slot 0, the rest on slot 1. 0 when it finished; else the slot's status (a fault),
++ * 0xfe (an error with no status) or 0xff (no answer within a second) -- and then the GPU is reset, so
++ * the next job finds it working.
+  */
+-uint32_t
+-a135f_mali_submit(uint64_t chain, bool fragment)
++static uint32_t
++submit_on(uint32_t as, uint64_t chain, bool fragment)
+ {
+ 	uint32_t slot = fragment ? 0 : 1, js = fragment ? JS0 : JS1, raw, status = 0;
+-	bool finished;
++	const uint32_t done = 1u << slot, error = 1u << (slot + 16);
+ 
+ 	lck_mtx_lock(&mali_job_lock);
+ 	lck_mtx_lock(&mali_lock);
+-	wr(mali, JOB_INT_CLEAR, (1u << slot) | (1u << (slot + 16)));
++	__asm__ volatile ("dsb sy");            /* what the caller wrote (write-combined) is ours to publish */
++	wr(mali, JOB_INT_CLEAR, done | error);
+ 	wr(mali, js + JS_HEAD_NEXT_LO, (uint32_t)chain);
+ 	wr(mali, js + JS_HEAD_NEXT_HI, (uint32_t)(chain >> 32));
+ 	wr(mali, js + JS_AFFINITY_NEXT_LO, shader_mask);
+ 	wr(mali, js + JS_AFFINITY_NEXT_HI, 0);
+-	wr(mali, js + JS_CONFIG_NEXT, JS_CONFIG);
++	wr(mali, js + JS_CONFIG_NEXT, JS_CONFIG | as);
+ 	wr(mali, js + JS_COMMAND_NEXT, 1);
+ 	lck_mtx_unlock(&mali_lock);
+-	finished = wait_job(JOB_INT_RAWSTAT, (1u << slot) | (1u << (slot + 16)), 1u << slot, 1000);
++	(void)wait_any(JOB_INT_RAWSTAT, done | error, 1000);
+ 	lck_mtx_lock(&mali_lock);
+-	if (!finished) {
+-		raw = rd(mali, JOB_INT_RAWSTAT);
+-		status = (raw & (1u << (slot + 16))) ? rd(mali, js + JS_STATUS) : 0xff;
+-		printf("a135f mali: a job on slot %u did not finish: interrupts %#x, status %#x, MMU %#x fault %#x at %#x%08x\n", slot,
+-		    raw, rd(mali, js + JS_STATUS), rd(mali, MMU_INT_RAWSTAT), rd(mali, AS0 + AS_FAULTSTATUS),
+-		    rd(mali, AS0 + AS_FAULTADDRESS_HI), rd(mali, AS0 + AS_FAULTADDRESS_LO));
+-		wr(mali, GPU_INT_CLEAR, 0xffffffffu);
+-		wr(mali, GPU_CMD, 1);           /* soft reset, then everything back as it was */
+-		(void)wait_for(mali, GPU_INT_RAWSTAT, IRQ_RESET_COMPLETED, IRQ_RESET_COMPLETED, 100);
+-		wr(mali, L2_PWRON, rd(mali, L2_PRESENT));
+-		wr(mali, TILER_PWRON, rd(mali, TILER_PRESENT));
+-		wr(mali, SHADER_PWRON, shader_mask);
+-		(void)wait_for(mali, SHADER_READY, shader_mask, shader_mask, 50);
+-		as0_update(pt_top_phys, TRANSCFG_AARCH64_4K);
+-		wr(mali, MMU_INT_CLEAR, 0xffffffffu);
+-	}
+-	wr(mali, JOB_INT_CLEAR, (1u << slot) | (1u << (slot + 16)));
++	raw = rd(mali, JOB_INT_RAWSTAT);
++	if ((raw & done) == 0) {
++		status = (raw & error) ? rd(mali, js + JS_STATUS) : 0xff;
++		if (status == 0) {
++			status = 0xfe;
++		}
++		gpu_faults++;
++		printf("a135f mali: a job on slot %u (AS%u) did not finish: interrupts %#x, status %#x, MMU %#x fault %#x at %#x%08x\n",
++		    slot, as, raw, rd(mali, js + JS_STATUS), rd(mali, MMU_INT_RAWSTAT), rd(mali, AS_REG(as, AS_FAULTSTATUS)),
++		    rd(mali, AS_REG(as, AS_FAULTADDRESS_HI)), rd(mali, AS_REG(as, AS_FAULTADDRESS_LO)));
++		device_recover();
++	}
++	wr(mali, JOB_INT_CLEAR, done | error);
+ 	lck_mtx_unlock(&mali_lock);
+ 	lck_mtx_unlock(&mali_job_lock);
+ 	return status;
+ }
+ 
++uint32_t
++a135f_mali_submit(uint64_t chain, bool fragment)
++{
++	return submit_on(0, chain, fragment);
++}
++
++/* ---- per-client address spaces (the NativeMali service, iokit/Kernel/arm/A135FMaliNative.cpp) ---- */
++
++/* A new context in a free address space (not AS0, which is the kernel's own); NULL when none is left. */
++struct mali_vm *
++a135f_mali_vm_create(void)
++{
++	struct mali_vm *vm = NULL;
++
++	if (!a135f_mali_ready()) {
++		return NULL;
++	}
++	lck_mtx_lock(&mali_job_lock);
++	lck_mtx_lock(&mali_lock);
++	for (uint32_t as = 1; as < MALI_MAX_AS && vm == NULL; as++) {
++		if (((as_present >> as) & 1) != 0 && vm_table[as] == NULL) {
++			vm = &vm_pool[as];
++			bzero(vm, sizeof(*vm));
++			vm->as = as;
++			if ((vm->top = pt_page(&vm->top_phys)) == NULL) {
++				vm = NULL;
++				break;
++			}
++			vm->live = true;
++			vm_table[as] = vm;
++			as_update(as, vm->top_phys, TRANSCFG_AARCH64_4K);
++		}
++	}
++	lck_mtx_unlock(&mali_lock);
++	lck_mtx_unlock(&mali_job_lock);
++	return vm;
++}
++
++void
++a135f_mali_vm_destroy(struct mali_vm *vm)
++{
++	lck_mtx_lock(&mali_job_lock);
++	lck_mtx_lock(&mali_lock);
++	as_update(vm->as, 0, 1);                /* the address space maps nothing any more */
++	vm_table[vm->as] = NULL;
++	vm_free_tables(vm);
++	lck_mtx_unlock(&mali_lock);
++	lck_mtx_unlock(&mali_job_lock);
++}
++
++bool
++a135f_mali_vm_map(struct mali_vm *vm, uint64_t iova, uint64_t phys, bool writable)
++{
++	bool done;
++
++	lck_mtx_lock(&mali_lock);
++	done = map_page_perm(vm, iova, phys, writable);
++	lck_mtx_unlock(&mali_lock);
++	return done;
++}
++
++void
++a135f_mali_vm_mapped(struct mali_vm *vm)
++{
++	vm_resync(vm);
++}
++
++void
++a135f_mali_vm_unmap(struct mali_vm *vm, uint64_t iova, uint64_t size)
++{
++	vm_unmap_common(vm, iova, size);
++}
++
++uint32_t
++a135f_mali_vm_submit(struct mali_vm *vm, uint64_t chain, bool fragment)
++{
++	return submit_on(vm->as, chain, fragment);
++}
++
++/* A GPU information register (offsets under 0x400, the read-only block), for the device-info record. */
++bool
++a135f_mali_info_reg(uint32_t offset, uint32_t *value)
++{
++	if (!a135f_mali_ready() || offset >= 0x400 || (offset & 3) != 0) {
++		return false;
++	}
++	*value = rd(mali, offset);
++	return true;
++}
++
++uint64_t
++a135f_mali_faults(void)
++{
++	return gpu_faults;
++}
++
++uint64_t
++a135f_mali_resets(void)
++{
++	return gpu_resets;
++}
++
++/* Device-wide recovery after a fault the client cannot clear itself. Mappings and tables survive. */
++void
++a135f_mali_reset_device(void)
++{
++	lck_mtx_lock(&mali_job_lock);
++	lck_mtx_lock(&mali_lock);
++	device_recover();
++	lck_mtx_unlock(&mali_lock);
++	lck_mtx_unlock(&mali_job_lock);
++}
++
+ /* Run a chain to its end; its number comes back, its status in *status. */
+ uint64_t
+ a135f_mali_run(uint64_t chain, bool fragment, uint32_t *status)

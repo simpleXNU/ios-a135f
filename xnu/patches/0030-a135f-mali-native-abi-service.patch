@@ -1,0 +1,638 @@
+diff --git a/iokit/Kernel/arm/A135FMali.cpp b/iokit/Kernel/arm/A135FMali.cpp
+index a1d221b..949f3f6 100644
+--- a/iokit/Kernel/arm/A135FMali.cpp
++++ b/iokit/Kernel/arm/A135FMali.cpp
+@@ -36,6 +36,7 @@ void a135f_mali_unmap(uint64_t gpu, uint64_t size);
+ void a135f_mali_mapped(void);
+ uint64_t a135f_mali_run(uint64_t chain, bool fragment, uint32_t * status);
+ void A135FMaliStart(void);
++void A135FMaliNativeStart(void);
+ }
+ 
+ /* Linux's include/uapi/drm/panfrost_drm.h and drm.h: the requests' numbers and structures. */
+@@ -134,6 +135,7 @@ A135FMaliStart(void)
+ 		IOLog("A135FMali: the service did not start\n");
+ 	}
+ 	gpu->release();
++	A135FMaliNativeStart();                 /* Mali Metal's interface, next to this one */
+ 	IOLog("A135FMali: the GPU is there for programs to draw with\n");
+ }
+ 
+diff --git a/iokit/Kernel/arm/A135FMaliNative.cpp b/iokit/Kernel/arm/A135FMaliNative.cpp
+new file mode 100644
+index 0000000..4d4bca2
+--- /dev/null
++++ b/iokit/Kernel/arm/A135FMaliNative.cpp
+@@ -0,0 +1,600 @@
++/*
++ * NativeMaliGpuService: the Galaxy A13's Mali-G52 for Mali Metal (PanVK + metal2vulkan), speaking the
++ * "NativeMali" ABI version 2 that MaliMetal's userland expects (selectors 1..11, fixed-size records, the
++ * service found by class name "NativeMaliGpuService", IOServiceOpen type 0). The record layouts below are
++ * written from that interface description; sizes are asserted.
++ *
++ * It sits on the same hardware bring-up as A135FMali (bsd/dev/a135f_mali.c, boot-arg a135f_mali=1) and is
++ * published next to it: A135FMali (panfrost's ioctls, for the OpenGL ES library) keeps address space 0;
++ * every connection here gets an address space of its own, its own tables, its own buffer table.
++ *
++ * What it is and is not:
++ *  - Jobs run to their end inside Submit (one at a time, device-wide). The fence it returns is already
++ *    signalled; WaitFence only checks that the fence is one this device issued and that no reset came
++ *    between. A job that faults makes Submit return kIOReturnIOError and the device is reset.
++ *  - Job slot: the first job of the chain decides (fragment jobs run on slot 0, anything else on slot 1),
++ *    as panfrost's own kernel driver does for Mesa's requirement flags.
++ *  - Buffers are write-combined kernel memory, never imported from IOSurfaces (the ABI has no import).
++ *  - GPU addresses are the caller's, inside [32 MiB, 4 GiB): the window Linux's panfrost gives JM Mesa.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(A135F)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++
++extern "C" {
++struct mali_vm;
++bool a135f_mali_ready(void);
++struct mali_vm *a135f_mali_vm_create(void);
++void a135f_mali_vm_destroy(struct mali_vm * vm);
++bool a135f_mali_vm_map(struct mali_vm * vm, uint64_t iova, uint64_t phys, bool writable);
++void a135f_mali_vm_mapped(struct mali_vm * vm);
++void a135f_mali_vm_unmap(struct mali_vm * vm, uint64_t iova, uint64_t size);
++uint32_t a135f_mali_vm_submit(struct mali_vm * vm, uint64_t chain, bool fragment);
++bool a135f_mali_info_reg(uint32_t offset, uint32_t * value);
++uint64_t a135f_mali_faults(void);
++uint64_t a135f_mali_resets(void);
++void a135f_mali_reset_device(void);
++void A135FMaliNativeStart(void);
++}
++
++/* ---- the ABI's records (all little-endian, no padding beyond what is written) ---- */
++struct nm_query { uint32_t abi_version, input_bits, output_bits, flags; uint64_t max_bo_bytes; };
++struct nm_device_info {
++	uint32_t gpu_id, shader_present_lo, shader_present_hi, tiler_present_lo, tiler_present_hi;
++	uint32_t thread_max_threads, max_workgroup_size, max_barrier_size, l2_features, core_features, tiler_features, flags;
++	uint64_t va_start, va_size;
++	uint32_t mem_features, mmu_features, afbc_features, texture_features[4];
++	uint32_t max_tasks_per_core, registers_per_core, tls_instances_per_core, pgsize_shift, vm_op_flags;
++};
++struct nm_bo_alloc { uint64_t bytes; };
++struct nm_handle { uint64_t handle; };                       /* BoAllocReply, BoFree, BoCpuMap */
++struct nm_bo_map { uint64_t handle, iova; uint32_t permissions, reserved; };
++struct nm_iova { uint64_t iova; };                           /* BoMapReply */
++struct nm_cpu_map_reply { uint32_t token, reserved; uint64_t bytes; };
++struct nm_cpu_unmap { uint64_t handle; uint32_t token, reserved; };
++struct nm_submit { uint64_t job_chain, wait_fence, wait_timeout_ns; uint32_t flags, reserved; };
++struct nm_fence { uint64_t fence; };                         /* SubmitReply */
++struct nm_wait { uint64_t fence, timeout_ns; };
++struct nm_status { uint64_t faults, resets; };
++static_assert(sizeof(nm_query) == 24, "query");
++static_assert(sizeof(nm_device_info) == 112, "device info");
++static_assert(sizeof(nm_bo_map) == 24, "map");
++static_assert(sizeof(nm_cpu_map_reply) == 16, "cpu map reply");
++static_assert(sizeof(nm_cpu_unmap) == 16, "cpu unmap");
++static_assert(sizeof(nm_submit) == 32, "submit");
++static_assert(sizeof(nm_wait) == 16, "wait");
++static_assert(sizeof(nm_status) == 16, "status");
++
++enum {
++	kNmQuery = 1, kNmDeviceInfo, kNmBoAlloc, kNmBoMap, kNmBoFree, kNmBoCpuMap, kNmBoCpuUnmap, kNmSubmit, kNmWaitFence,
++	kNmStatus, kNmReset,
++	kNmAbiV2 = 2, kNmAbiV1 = 1,
++	kNmPage = 4096, kNmMaxBoBytes = 1 << 27, kNmChainAlign = 64,
++	kNmRead = 1, kNmWrite = 2,
++	kNmBoCapacity = 1024,
++	kNmFenceShift = 40,
++};
++#define NM_VA_START     0x02000000ull       /* 32 MiB */
++#define NM_VA_END       0x100000000ull      /* 4 GiB */
++#define NM_CLIENT_BYTES (1ull << 30)        /* one connection may hold this much buffer memory */
++#define NM_FRAGMENT_JOB 9u                  /* Bifrost JOB_TYPE_FRAGMENT */
++
++struct nm_bo {
++	IOBufferMemoryDescriptor * mem;         /* NULL: slot free */
++	uint64_t bytes;
++	uint64_t iova;                          /* 0: not mapped */
++	uint32_t generation;                    /* of this slot, in the handle */
++	uint32_t token;                         /* 0: no CPU mapping handed out */
++};
++
++static IOLock * gNmLock;
++static uint64_t gNmSeq;                     /* fences issued, device-wide */
++
++class NativeMaliGpuService : public IOService
++{
++	OSDeclareDefaultStructors(NativeMaliGpuService);
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(NativeMaliGpuService, IOService);
++
++bool
++NativeMaliGpuService::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "NativeMaliGpuClient");
++	setName("NativeMaliGpuService");
++	registerService();
++	return true;
++}
++
++void
++A135FMaliNativeStart(void)
++{
++	IOService * provider = IOService::getPlatform();
++	NativeMaliGpuService * service;
++
++	gNmLock = IOLockAlloc();
++	service = OSTypeAlloc(NativeMaliGpuService);
++	if (service == NULL || provider == NULL || gNmLock == NULL || !service->init() || !service->attach(provider)) {
++		OSSafeReleaseNULL(service);
++		IOLog("NativeMaliGpuService: cannot create the service\n");
++		return;
++	}
++	if (!service->start(provider)) {
++		service->detach(provider);
++		IOLog("NativeMaliGpuService: the service did not start\n");
++	}
++	service->release();
++	IOLog("NativeMaliGpuService: Mali Metal's kernel interface is up\n");
++}
++
++class NativeMaliGpuClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(NativeMaliGpuClient);
++
++	struct mali_vm * fVm;
++	struct nm_bo * fBo;
++	uint64_t fHeld;                         /* bytes of buffers alive */
++	bool fClosed;
++
++	struct nm_bo * lookup(uint64_t handle);
++	bool overlaps(uint64_t iova, uint64_t bytes);
++	void releaseBo(struct nm_bo * b);
++	void closeAll(void);
++	bool deviceInfo(struct nm_device_info * info);
++	bool fenceValid(uint64_t fence, IOReturn * why);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    __unused IOExternalMethodDispatch * dispatch, __unused OSObject * target, __unused void * reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(NativeMaliGpuClient, IOUserClient);
++
++bool
++NativeMaliGpuClient::start(IOService * provider)
++{
++	if (!a135f_mali_ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fBo = IONewZero(struct nm_bo, kNmBoCapacity);
++	if (fBo == NULL) {
++		return false;
++	}
++	for (uint32_t i = 0; i < kNmBoCapacity; i++) {
++		fBo[i].generation = 1;
++	}
++	fVm = a135f_mali_vm_create();
++	if (fVm == NULL) {
++		IOLog("NativeMaliGpuService: no address space left for a connection\n");
++		return false;
++	}
++	return true;
++}
++
++/* handle = generation << 32 | slot + 1 */
++struct nm_bo *
++NativeMaliGpuClient::lookup(uint64_t handle)
++{
++	uint32_t slot = (uint32_t)(handle & 0xffffffffu), generation = (uint32_t)(handle >> 32);
++
++	if (slot == 0 || slot > kNmBoCapacity || fBo == NULL) {
++		return NULL;
++	}
++	struct nm_bo * b = &fBo[slot - 1];
++
++	return (b->mem != NULL && b->generation == generation) ? b : NULL;
++}
++
++bool
++NativeMaliGpuClient::overlaps(uint64_t iova, uint64_t bytes)
++{
++	for (uint32_t i = 0; i < kNmBoCapacity; i++) {
++		if (fBo[i].mem != NULL && fBo[i].iova != 0 && iova < fBo[i].iova + fBo[i].bytes && fBo[i].iova < iova + bytes) {
++			return true;
++		}
++	}
++	return false;
++}
++
++void
++NativeMaliGpuClient::releaseBo(struct nm_bo * b)
++{
++	uint32_t generation = b->generation + 1;
++
++	if (b->iova != 0) {
++		a135f_mali_vm_unmap(fVm, b->iova, b->bytes);
++	}
++	fHeld -= b->bytes;
++	b->mem->release();
++	bzero(b, sizeof(*b));
++	b->generation = generation != 0 ? generation : 1;
++}
++
++void
++NativeMaliGpuClient::closeAll(void)
++{
++	if (fClosed) {
++		return;
++	}
++	fClosed = true;
++	if (fBo != NULL) {
++		for (uint32_t i = 0; i < kNmBoCapacity; i++) {
++			if (fBo[i].mem != NULL) {
++				releaseBo(&fBo[i]);
++			}
++		}
++	}
++	if (fVm != NULL) {
++		a135f_mali_vm_destroy(fVm);
++		fVm = NULL;
++	}
++}
++
++IOReturn
++NativeMaliGpuClient::clientClose(void)
++{
++	IOLockLock(gNmLock);
++	closeAll();
++	IOLockUnlock(gNmLock);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++NativeMaliGpuClient::free(void)
++{
++	IOLockLock(gNmLock);
++	closeAll();
++	IOLockUnlock(gNmLock);
++	if (fBo != NULL) {
++		IODelete(fBo, struct nm_bo, kNmBoCapacity);
++		fBo = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++NativeMaliGpuClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	IOReturn ret = kIOReturnBadArgument;
++	uint32_t slot = type & 0xffff;
++
++	IOLockLock(gNmLock);
++	if (slot != 0 && slot <= kNmBoCapacity && fBo != NULL && fBo[slot - 1].mem != NULL && fBo[slot - 1].token == type) {
++		fBo[slot - 1].mem->retain();
++		*memory = fBo[slot - 1].mem;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gNmLock);
++	return ret;
++}
++
++/* The numbers of the GPU, from its read-only registers; the thread properties are derived as panfrost does. */
++bool
++NativeMaliGpuClient::deviceInfo(struct nm_device_info * d)
++{
++	uint32_t thread_features = 0, tls_alloc = 0, texture[4] = { 0, 0, 0, 0 };
++	bool ok = true;
++
++	bzero(d, sizeof(*d));
++	ok &= a135f_mali_info_reg(0x000, &d->gpu_id);
++	ok &= a135f_mali_info_reg(0x100, &d->shader_present_lo);
++	ok &= a135f_mali_info_reg(0x104, &d->shader_present_hi);
++	ok &= a135f_mali_info_reg(0x110, &d->tiler_present_lo);
++	ok &= a135f_mali_info_reg(0x114, &d->tiler_present_hi);
++	ok &= a135f_mali_info_reg(0x0a0, &d->thread_max_threads);
++	ok &= a135f_mali_info_reg(0x0a4, &d->max_workgroup_size);
++	ok &= a135f_mali_info_reg(0x0a8, &d->max_barrier_size);
++	ok &= a135f_mali_info_reg(0x004, &d->l2_features);
++	ok &= a135f_mali_info_reg(0x008, &d->core_features);
++	ok &= a135f_mali_info_reg(0x00c, &d->tiler_features);
++	ok &= a135f_mali_info_reg(0x010, &d->mem_features);
++	ok &= a135f_mali_info_reg(0x014, &d->mmu_features);
++	ok &= a135f_mali_info_reg(0x04c, &d->afbc_features);
++	ok &= a135f_mali_info_reg(0x0ac, &thread_features);
++	ok &= a135f_mali_info_reg(0x310, &tls_alloc);
++	for (uint32_t i = 0; i < 4; i++) {
++		ok &= a135f_mali_info_reg(0x0b0 + 4 * i, &texture[i]);
++		d->texture_features[i] = texture[i];
++	}
++	d->flags = 1;                                       /* NativeMaliDeviceNonCoherent */
++	d->va_start = NM_VA_START;
++	d->va_size = NM_VA_END - NM_VA_START;
++	d->max_tasks_per_core = thread_features >> 24 ? thread_features >> 24 : 1;
++	d->registers_per_core = (thread_features & 0xffff) ? (thread_features & 0xffff) : d->thread_max_threads * 32;
++	d->tls_instances_per_core = tls_alloc ? tls_alloc : d->thread_max_threads;
++	d->pgsize_shift = 12;
++	d->vm_op_flags = 3;                                 /* map | unmap */
++	return ok && d->gpu_id != 0;
++}
++
++/* A fence this device issued, in the current reset generation. */
++bool
++NativeMaliGpuClient::fenceValid(uint64_t fence, IOReturn * why)
++{
++	uint64_t generation = fence >> kNmFenceShift, seq = fence & ((1ull << kNmFenceShift) - 1);
++
++	if (fence == 0 || seq == 0 || seq > gNmSeq) {
++		*why = kIOReturnBadArgument;
++		return false;
++	}
++	if (generation != (a135f_mali_resets() & 0xffffff)) {
++		*why = kIOReturnIOError;                        /* issued before a reset: its work is lost */
++		return false;
++	}
++	return true;
++}
++
++IOReturn
++NativeMaliGpuClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    __unused IOExternalMethodDispatch * dispatch, __unused OSObject * target, __unused void * reference)
++{
++	const void * in = args->structureInput;
++	void * out = args->structureOutput;
++	const uint32_t in_size = args->structureInputSize, out_size = args->structureOutputSize;
++	IOReturn ret = kIOReturnSuccess;
++	uint32_t reply_size = 0;
++	union {
++		struct nm_query query;
++		struct nm_device_info info;
++		struct nm_handle handle;
++		struct nm_iova iova;
++		struct nm_cpu_map_reply cpu;
++		struct nm_fence fence;
++		struct nm_status status;
++	} reply;
++
++	if (!a135f_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&reply, sizeof(reply));
++	IOLockLock(gNmLock);
++	if (fClosed || fVm == NULL) {
++		IOLockUnlock(gNmLock);
++		return kIOReturnNotAttached;
++	}
++	switch (selector) {
++	case kNmQuery: {
++		const struct nm_query * q = (const struct nm_query *) in;
++
++		if (in == NULL || in_size != sizeof(*q) || out_size != sizeof(reply.query) || q->flags != 0 ||
++		    (q->abi_version != kNmAbiV2 && q->abi_version != kNmAbiV1)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		reply.query.abi_version = q->abi_version;
++		reply.query.input_bits = 35;                    /* the tables here are three levels of 4 KB pages */
++		reply.query.output_bits = 40;
++		reply.query.flags = 0;
++		reply.query.max_bo_bytes = kNmMaxBoBytes;
++		reply_size = sizeof(reply.query);
++		break;
++	}
++	case kNmDeviceInfo:
++		if (in_size != 0 || (out_size != sizeof(reply.info) && out_size != 64)) {
++			ret = kIOReturnBadArgument;
++		} else if (!deviceInfo(&reply.info)) {
++			ret = kIOReturnNotReady;
++		} else {
++			reply_size = out_size;                      /* 64: the v1 record is a prefix of v2 */
++		}
++		break;
++	case kNmBoAlloc: {
++		const struct nm_bo_alloc * a = (const struct nm_bo_alloc *) in;
++		IOBufferMemoryDescriptor * mem;
++		uint32_t slot = 0;
++
++		if (in == NULL || in_size != sizeof(*a) || out_size != sizeof(reply.handle)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (a->bytes == 0 || (a->bytes % kNmPage) != 0 || a->bytes > kNmMaxBoBytes) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (fHeld + a->bytes > NM_CLIENT_BYTES) {
++			ret = kIOReturnNoSpace;
++			break;
++		}
++		for (slot = 0; slot < kNmBoCapacity && fBo[slot].mem != NULL; slot++) {
++		}
++		if (slot == kNmBoCapacity) {
++			ret = kIOReturnNoSpace;
++			break;
++		}
++		mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++		    kIOMapWriteCombineCache, (vm_size_t) round_page_64(a->bytes), PAGE_SIZE);
++		if (mem == NULL) {
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		bzero(mem->getBytesNoCopy(), (size_t) round_page_64(a->bytes));
++		fBo[slot].mem = mem;
++		fBo[slot].bytes = a->bytes;
++		fBo[slot].iova = 0;
++		fBo[slot].token = 0;
++		fHeld += a->bytes;
++		reply.handle.handle = ((uint64_t) fBo[slot].generation << 32) | (slot + 1);
++		reply_size = sizeof(reply.handle);
++		break;
++	}
++	case kNmBoMap: {
++		const struct nm_bo_map * m = (const struct nm_bo_map *) in;
++		struct nm_bo * b;
++		bool mapped = true;
++
++		if (in == NULL || in_size != sizeof(*m) || out_size != sizeof(reply.iova) || m->reserved != 0 ||
++		    (m->permissions & kNmRead) == 0 || (m->permissions & ~(uint32_t)(kNmRead | kNmWrite)) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if ((b = lookup(m->handle)) == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (b->iova != 0) {
++			ret = kIOReturnBusy;
++			break;
++		}
++		if (m->iova == 0 || (m->iova % kNmPage) != 0 || m->iova < NM_VA_START || m->iova + b->bytes > NM_VA_END ||
++		    m->iova + b->bytes < m->iova || overlaps(m->iova, b->bytes)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		for (uint64_t off = 0; off < b->bytes && mapped; off += kNmPage) {
++			IOByteCount length = 0;
++			addr64_t phys = b->mem->getPhysicalSegment(off, &length, kIOMemoryMapperNone);
++
++			mapped = phys != 0 && a135f_mali_vm_map(fVm, m->iova + off, phys, (m->permissions & kNmWrite) != 0);
++		}
++		if (!mapped) {
++			a135f_mali_vm_unmap(fVm, m->iova, b->bytes);
++			ret = kIOReturnNoMemory;
++			break;
++		}
++		a135f_mali_vm_mapped(fVm);
++		b->iova = m->iova;
++		reply.iova.iova = m->iova;
++		reply_size = sizeof(reply.iova);
++		break;
++	}
++	case kNmBoFree: {
++		const struct nm_handle * h = (const struct nm_handle *) in;
++		struct nm_bo * b;
++
++		if (in == NULL || in_size != sizeof(*h) || out_size != 0 || (b = lookup(h->handle)) == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		releaseBo(b);
++		break;
++	}
++	case kNmBoCpuMap: {
++		const struct nm_handle * h = (const struct nm_handle *) in;
++		struct nm_bo * b;
++
++		if (in == NULL || in_size != sizeof(*h) || out_size != sizeof(reply.cpu) || (b = lookup(h->handle)) == NULL) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (b->token != 0) {
++			ret = kIOReturnBusy;
++			break;
++		}
++		b->token = ((b->generation & 0x7fff) << 16) | (uint32_t)((h->handle & 0xffffffffu));
++		reply.cpu.token = b->token;
++		reply.cpu.bytes = b->bytes;
++		reply_size = sizeof(reply.cpu);
++		break;
++	}
++	case kNmBoCpuUnmap: {
++		const struct nm_cpu_unmap * u = (const struct nm_cpu_unmap *) in;
++		struct nm_bo * b;
++
++		if (in == NULL || in_size != sizeof(*u) || out_size != 0 || u->reserved != 0 || (b = lookup(u->handle)) == NULL ||
++		    b->token == 0 || b->token != u->token) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		b->token = 0;
++		break;
++	}
++	case kNmSubmit: {
++		const struct nm_submit * s = (const struct nm_submit *) in;
++		bool fragment = false, found = false;
++		uint32_t header = 0, status;
++
++		if (in == NULL || in_size != sizeof(*s) || out_size != sizeof(reply.fence) || s->flags != 0 || s->reserved != 0 ||
++		    s->job_chain == 0 || (s->job_chain % kNmChainAlign) != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		if (s->wait_fence != 0 && !fenceValid(s->wait_fence, &ret)) {
++			break;
++		}
++		for (uint32_t i = 0; i < kNmBoCapacity && !found; i++) {
++			struct nm_bo * b = &fBo[i];
++
++			if (b->mem != NULL && b->iova != 0 && s->job_chain >= b->iova && s->job_chain + kNmChainAlign <= b->iova + b->bytes) {
++				found = b->mem->readBytes((IOByteCount)(s->job_chain - b->iova + 16), &header, sizeof(header)) == sizeof(header);
++			}
++		}
++		if (!found) {
++			ret = kIOReturnBadArgument;                 /* the chain is not inside a buffer this connection mapped */
++			break;
++		}
++		fragment = ((header >> 1) & 0x7f) == NM_FRAGMENT_JOB;
++		IOLockUnlock(gNmLock);                          /* the job takes its time; other connections go on */
++		status = a135f_mali_vm_submit(fVm, s->job_chain, fragment);
++		IOLockLock(gNmLock);
++		if (fClosed || fVm == NULL) {
++			ret = kIOReturnAborted;
++			break;
++		}
++		if (status != 0) {
++			IOLog("NativeMaliGpuService: a job chain at %#llx failed (status %#x)\n", s->job_chain, status);
++			ret = kIOReturnIOError;
++			break;
++		}
++		reply.fence.fence = ((a135f_mali_resets() & 0xffffff) << kNmFenceShift) | (++gNmSeq & ((1ull << kNmFenceShift) - 1));
++		reply_size = sizeof(reply.fence);
++		break;
++	}
++	case kNmWaitFence: {
++		const struct nm_wait * w = (const struct nm_wait *) in;
++
++		if (in == NULL || in_size != sizeof(*w) || out_size != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		(void)fenceValid(w->fence, &ret);               /* done before Submit returned: valid means signalled */
++		break;
++	}
++	case kNmStatus:
++		if (in_size != 0 || out_size != sizeof(reply.status)) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		reply.status.faults = a135f_mali_faults();
++		reply.status.resets = a135f_mali_resets();
++		reply_size = sizeof(reply.status);
++		break;
++	case kNmReset:
++		if (in_size != 0 || out_size != 0) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		a135f_mali_reset_device();
++		break;
++	default:
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gNmLock);
++	if (ret == kIOReturnSuccess && reply_size != 0) {
++		if (out == NULL) {
++			return kIOReturnBadArgument;
++		}
++		bcopy(&reply, out, reply_size);
++		args->structureOutputSize = reply_size;
++	}
++	return ret;
++}
++#endif /* A135F */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 826a950..dac6369 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/A135FWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/A135FSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/A135FFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/A135FMali.cpp                                   optional iokitcpp
++iokit/Kernel/arm/A135FMaliNative.cpp                             optional iokitcpp
+ iokit/Kernel/arm/A135FBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/A135FHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
