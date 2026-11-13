@@ -2,6 +2,16 @@
 
 **iOS 16 on a Samsung Galaxy A13 (SM-A135F)**
 
+## PREPARE BUILD ENV
+```
+sudo apt install -y \
+  git curl unzip rsync python3 python3-venv python3-pip \
+  meson ninja-build bison flex \
+  hfsprogs android-sdk-libsparse-utils \
+  gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+  fuse3 libfuse-dev cmake g++ zlib1g-dev libbz2-dev
+```
+
 ## Hardware status
 
 | Area | A13 (Exynos850) | State |
@@ -19,7 +29,7 @@
 | Touch | OVT TD4150 firmware embedded in ADT via `mkadt.py --touch-fw`, seems like theres an issue there though. | WIP |
 | USB | DWC3 USB | Working |
 | Display Enable | `DECON_F` (`0x13060000`) + `0x70 = 0x1281`; written by shim and kernel | Working |
-| GPU | Mali-G52 | Not implemented |
+| GPU | Mali-G52 | Kernel service + OpenGL ES (Mesa panfrost); Metal ported, see docs/METAL.md (not yet run on hardware) |
 | Audio | ABOX audio | Not implemented |
 | Wi-Fi | Samsung S612 | Not implemented |
 | Bluetooth | Part of Wi-Fi | Not implemented |
@@ -47,6 +57,14 @@
 tools/ios-create-root-full.sh <url_to_ipsw or path/to/ipsw> --gl userland/out
 ```
 
+Or:
+```
+source ~/ios-toolchain/env.sh
+./build.sh --full \
+  --kernel /path/to/ipsw \
+  --ipsw /path/to/ipsw \
+  --qc-metallib $PWD/prebuilts/shaders/default.metallib
+```
 
 # Todo: REWRITE
 1. **Payload and blobs:**
