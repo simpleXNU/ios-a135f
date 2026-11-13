@@ -1,0 +1,241 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -2,5 +2,6 @@
+ bsd/dev/a135f_keys.c			standard
+ bsd/dev/a135f_touch.c			standard
+ bsd/dev/a135f_mali.c			standard
++bsd/dev/a135f_say.c			standard
+ bsd/dev/a135f_usb.c			standard
+ bsd/dev/mem.c				standard
+diff --git a/bsd/dev/a135f_say.c b/bsd/dev/a135f_say.c
+--- a/bsd/dev/a135f_say.c
++++ b/bsd/dev/a135f_say.c
+@@ -0,0 +1,66 @@
++/*
++ * kern.a135f.say: a line from a program into the kernel's log (a job's own output is kept nowhere):
++ * sysctlbyname("kern.a135f.say", NULL, NULL, line, strlen(line)). The Metal plug-in and Mesa's
++ * panfrost patches report through it. kern.a135f.host_keep is the same channel under the name the
++ * plug-in's recipe log uses. kern.a135f.bind_cpu=N binds the calling thread to logical processor N
++ * (-1: any); the plug-in asks for it only with boot-arg bigcore=1, which this all-A55 SoC has no use for.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_A135F)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/thread.h>
++
++extern void *cpu_to_processor(int cpu);
++extern void *thread_bind(void *processor);
++extern int thread_block(void *continuation);
++extern unsigned int real_ncpus;
++
++SYSCTL_DECL(_kern);
++SYSCTL_NODE(_kern, OID_AUTO, a135f, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "A13 port");
++
++static int
++say_line(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char line[512];
++	size_t length = req->newlen;
++
++	if (req->newptr == USER_ADDR_NULL) {
++		return 0;
++	}
++	if (length > sizeof(line) - 1) {
++		length = sizeof(line) - 1;
++	}
++	if (SYSCTL_IN(req, line, length) != 0) {
++		return EINVAL;
++	}
++	line[length] = 0;
++	printf("%s%s", line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
++	return 0;
++}
++SYSCTL_PROC(_kern_a135f, OID_AUTO, say, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
++    NULL, 0, say_line, "A", "");
++SYSCTL_PROC(_kern_a135f, OID_AUTO, host_keep, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
++    NULL, 1, say_line, "A", "");
++
++static int
++bind_cpu(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int cpu = -1, error;
++
++	error = SYSCTL_IN(req, &cpu, sizeof(cpu));
++	if (error != 0 || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (cpu >= (int)real_ncpus) {
++		return EINVAL;
++	}
++	(void)thread_bind(cpu < 0 ? NULL : cpu_to_processor(cpu));
++	(void)thread_block(NULL);
++	return 0;
++}
++SYSCTL_PROC(_kern_a135f, OID_AUTO, bind_cpu, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
++    NULL, 0, bind_cpu, "I", "bind the calling thread to a logical processor");
++#endif /* ARM64_BOARD_CONFIG_A135F */
+diff --git a/iokit/Kernel/arm/A135FAccelerator.cpp b/iokit/Kernel/arm/A135FAccelerator.cpp
+--- a/iokit/Kernel/arm/A135FAccelerator.cpp
++++ b/iokit/Kernel/arm/A135FAccelerator.cpp
+@@ -0,0 +1,114 @@
++/*
++ * IOAcceleratorES for Metal, on the Galaxy A13 (published by A135FMaliStart, only with boot-arg
++ * a135f_metal=1: without it nothing here exists and CoreAnimation behaves as before).
++ *
++ * Metal finds a GPU in one way: IOServiceMatching("IOAcceleratorES"), then the service's string
++ * properties MetalPluginName and MetalPluginClassName, which name a bundle in
++ * /System/Library/Extensions and a class in it. A service without them is passed over by Metal and
++ * OpenGL ES alike. With the boot-arg, a user process (liba135f.inject.dylib in backboardd, or
++ * metal_props) may set exactly those two properties; an empty string removes one. Everything else is
++ * refused, whole, before anything is set.
++ *
++ * Why a boot-arg and not always: a device object Metal is handed half-made does not degrade, it
++ * aborts, and an aborting daemon is restarted by launchd. A boot made on purpose to have Metal is
++ * the only one that carries the switch.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(A135F)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++
++extern "C" void A135FAcceleratorStart(void);
++
++#define kPluginNameKey  "MetalPluginName"
++#define kPluginClassKey "MetalPluginClassName"
++
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++public:
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++IOReturn
++IOAcceleratorES::setProperties(OSObject * properties)
++{
++	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator * keys;
++	OSObject * next;
++	char who[32] = "?";
++
++	if (dict == NULL || dict->getCount() == 0) {
++		return kIOReturnBadArgument;
++	}
++	keys = OSCollectionIterator::withCollection(dict);
++	if (keys == NULL) {
++		return kIOReturnNoMemory;
++	}
++	proc_selfname(who, sizeof(who));
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
++
++		if (key == NULL || (!key->isEqualTo(kPluginNameKey) && !key->isEqualTo(kPluginClassKey))) {
++			IOLog("IOAcceleratorES: refusing what %s sent: only " kPluginNameKey " and " kPluginClassKey
++			    " are taken here\n", who);
++			keys->release();
++			return kIOReturnUnsupported;
++		}
++		if (OSDynamicCast(OSString, dict->getObject(key)) == NULL) {
++			IOLog("IOAcceleratorES: refusing \"%s\" from %s: Metal reads it as a CFString\n",
++			    key->getCStringNoCopy(), who);
++			keys->release();
++			return kIOReturnBadArgument;
++		}
++	}
++	keys->reset();
++	while ((next = keys->getNextObject()) != NULL) {
++		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
++		OSString * value = OSDynamicCast(OSString, dict->getObject(key));
++
++		if (value->getLength() == 0) {
++			removeProperty(key);
++			IOLog("IOAcceleratorES: %s removed by %s\n", key->getCStringNoCopy(), who);
++		} else if (setProperty(key, value)) {
++			IOLog("IOAcceleratorES: %s = %s, set by %s\n", key->getCStringNoCopy(),
++			    value->getCStringNoCopy(), who);
++		} else {
++			keys->release();
++			return kIOReturnNoMemory;
++		}
++	}
++	keys->release();
++	return kIOReturnSuccess;
++}
++
++void
++A135FAcceleratorStart(void)
++{
++	IOService * provider = IOService::getPlatform();
++	IOAcceleratorES * accelerator;
++	uint32_t metal = 0;
++
++	if (!PE_parse_boot_argn("a135f_metal", &metal, sizeof(metal)) || metal == 0 || provider == NULL) {
++		return;
++	}
++	accelerator = OSTypeAlloc(IOAcceleratorES);
++	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
++		accelerator->setName("sgx");
++		accelerator->registerService();
++		IOLog("IOAcceleratorES: a135f_metal=%u: this service takes " kPluginNameKey " and " kPluginClassKey
++		    " from user space\n", metal);
++	}
++	OSSafeReleaseNULL(accelerator);
++}
++#endif /* A135F */
+diff --git a/iokit/Kernel/arm/A135FMali.cpp b/iokit/Kernel/arm/A135FMali.cpp
+--- a/iokit/Kernel/arm/A135FMali.cpp
++++ b/iokit/Kernel/arm/A135FMali.cpp
+@@ -37,6 +37,7 @@
+ uint64_t a135f_mali_run(uint64_t chain, bool fragment, uint32_t * status);
+ void A135FMaliStart(void);
+ void A135FMaliNativeStart(void);
++void A135FAcceleratorStart(void);
+ }
+ 
+ /* Linux's include/uapi/drm/panfrost_drm.h and drm.h: the requests' numbers and structures. */
+@@ -49,6 +50,7 @@
+ 	kPanfrostGetParam       = 0x44,
+ 	kPanfrostGetBOOffset    = 0x45,
+ 	kPanfrostMadvise        = 0x48,
++	kA135FSurfaceSeq        = 0x7c,         /* ours: a surface's last job (jobs are synchronous here: nothing to wait for) */
+ 	kA135FWait              = 0x7d,         /* ours: wait for a job by number (always already done) */
+ 	kA135FSurface           = 0x7e,         /* ours: an IOSurface's memory as a buffer */
+ };
+@@ -136,6 +138,7 @@
+ 	}
+ 	gpu->release();
+ 	A135FMaliNativeStart();                 /* Mali Metal's interface, next to this one */
++	A135FAcceleratorStart();                /* IOAcceleratorES for Metal, only with boot-arg a135f_metal=1 */
+ 	IOLog("A135FMali: the GPU is there for programs to draw with\n");
+ }
+ 
+@@ -452,6 +455,7 @@
+ 	case kA135FSurface:
+ 		ret = surfaceBuffer(&r.surface);
+ 		break;
++	case kA135FSurfaceSeq:
+ 	case kA135FWait:
+ 		break;
+ 	case kPanfrostWaitBO:                   /* every job has finished before its submission returned */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -1,3 +1,4 @@
+ iokit/Kernel/arm/A135FMali.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/A135FMaliNative.cpp                             optional iokitcpp
++iokit/Kernel/arm/A135FAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/A135FBattery.cpp                                optional iokitcpp
