@@ -66,13 +66,6 @@ They land in `/usr/local/bin/mali_test` and `/usr/local/lib/a135f/liba135f.injec
 
 ## C. OpenGL ES with Mesa panfrost (optional)
 
-Extra host packages (for Mesa's own `mesa_clc` tool, which panfrost's built-in shaders need):
-
-```bash
-sudo apt install llvm-dev libclang-dev libclang-cpp-dev libclc-dev libllvmspirvlib-dev spirv-tools libspirv-tools-dev glslang-tools
-```
-(Ubuntu 24.04 versions: LLVM 18; the packages must all be the same LLVM major version.)
-
 ```bash
 cd userland
 source ~/ios-toolchain/env.sh
@@ -82,9 +75,8 @@ GL=1 ./build.sh
 `build.sh GL=1` runs `mesa/mk-mesa.sh`, which:
 
 1. downloads Mesa 25.0.7 (checked against a SHA-256) into `mesa/build/`
-2. applies `mesa/patches/*.patch` and `mesa/apply-panfrost-darwin.py`. **If the script prints `MISSED`**, make that edit by hand
-   (what each one is for is in the script); re-run: finished edits are recognised
-3. builds `mesa_clc` for the host, then cross-builds `libOSMesa.8.dylib` (panfrost + softpipe) for iOS
+2. applies `mesa/patches/*.patch`, copies `mesa/a135f-drm` and `mesa/air` into the tree (they were checked against the pristine archive: `mesa/README-mesa.txt`)
+3. cross-builds `libOSMesa.8.dylib` (panfrost + softpipe, the AIR compiler inside) for iOS; no host `mesa_clc` is needed
 4. back in `build.sh`: `mkeagl.py` generates the GL entry table, and `src/eagl.c` + `src/gl_osmesa.c` become `liba135f.gl.dylib`
 
 Output in `userland/out/`: add `libOSMesa.8.dylib` and `liba135f.gl.dylib` to the root exactly as in B (`--gl userland/out`).
@@ -93,8 +85,6 @@ Common failures:
 
 | Symptom | Fix |
 |---|---|
-| `MISSED : …pan_kmod.c: bo mmap …` | Mesa's text differs: open the file, replace the `os_mmap(… bo->dev->fd …)` call by `a135f_drm_map(bo->dev->fd, bo->handle, size)` (and `os_munmap` by `a135f_drm_unmap(0, 0, addr)`) under `#ifdef __APPLE__` |
-| meson: `mesa_clc not found` | step "3." failed: read `mesa/build/meson-host.log`, `ninja-host.log` (mismatched LLVM / SPIRV packages) |
 | link error `_drmIoctl` etc. | `src/a135f-drm` was not picked up: check `mesa/build/mesa-25.0.7/src/a135f-drm/` exists and the meson edit applied |
 | `llvm-install-name-tool: not found` | `export INSTALL_NAME_TOOL=$HOME/ios-toolchain/bin/aarch64-apple-darwin-install_name_tool` |
 
@@ -106,3 +96,15 @@ Boot args: `a135f_mali=1` (kernel driver) and, for GL, `a135f_gl=1`. Then, from 
 sysctl kern.a135f_mali                 # 6 = the GPU ran a job through its page tables
 /usr/local/bin/mali_test               # exit 0, "the word: 0xa13c0de1"
 ```
+
+## D. Metal (optional, needs C)
+
+```bash
+cd userland
+source ~/ios-toolchain/env.sh
+QC_METALLIB=/path/to/QuartzCore-default.metallib GL=1 METAL=1 ./build.sh
+```
+
+Adds `out/A135FMetal.bundle`, `out/metal_props`, `out/metal_drv_test`, `out/metal_test`, `out/liba135f.air.dylib` and
+`out/share/`; install them with `--gl userland/out` as in B. How to make the metallib, which boot-args to use and what to
+expect: `docs/METAL.md`. Needs the kernel with patch 0031.

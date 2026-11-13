@@ -4031,7 +4031,7 @@ my_dealloc(id self, SEL selector)
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
 }
 
-/* Does the display's driver wait for the GPU before it shows a surface (iokit/Kernel/MiniIOMobileFramebuffer.cpp)? */
+/* Does the display's driver wait for the GPU before it shows a surface (iokit/Kernel/arm/A135FAccelerator.cpp)? */
 static bool
 display_waits(void)
 {

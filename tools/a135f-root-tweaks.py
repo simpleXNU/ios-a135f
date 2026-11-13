@@ -24,7 +24,9 @@ screen (image versions v8-v14 in NOTES.md):
   Setup           skipped: SetupDone, SetupFinishedAllSteps, SetupVersion 11,
                   mini-buddy flags off
   gpu (--gl DIR)  the Mali userland built by userland/build.sh (DIR = userland/out): its dylibs go to
-                  /usr/local/lib/a135f, its test programs to /usr/local/bin (boot with a135f_mali=1 a135f_gl=1)
+                  /usr/local/lib/a135f, its test programs to /usr/local/bin (boot with a135f_mali=1 a135f_gl=1). With METAL=1 builds also
+                  the Metal driver (/System/Library/Extensions/A135FMetal.bundle) and out/share (boot with
+                  a135f_metal=1 as well, see docs/METAL.md)
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
@@ -136,6 +138,35 @@ def gpu(root, src):
         os.chmod(d, 0o755)
     for name in sorted(os.listdir(src)):
         path = os.path.join(src, name)
+        if os.path.islink(path):        # liba135f.air.dylib -> libOSMesa.8.dylib: stays a link
+            dst = os.path.join(lib, name)
+            if os.path.lexists(dst):
+                os.remove(dst)
+            os.symlink(os.readlink(path), dst)
+            print('gpu:', os.path.relpath(dst, root), '->', os.readlink(path))
+            continue
+        if os.path.isdir(path) and name.endswith('.bundle'):
+            # Metal's discovery opens /System/Library/Extensions/<MetalPluginName>.bundle: a copy, not a link
+            dst = os.path.join(root, 'System/Library/Extensions', name)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(path, dst)
+            for here, dirs, files in os.walk(dst):
+                for n in dirs + files:
+                    os.chown(os.path.join(here, n), 0, 0)
+            os.chown(dst, 0, 0)
+            print('gpu: Metal driver', os.path.relpath(dst, root))
+            continue
+        if os.path.isdir(path) and name == 'share':
+            share = os.path.join(root, 'usr/local/share/a135f')
+            os.makedirs(share, exist_ok=True)
+            for n in sorted(os.listdir(path)):
+                dst = os.path.join(share, n)
+                shutil.copyfile(os.path.join(path, n), dst)
+                os.chown(dst, 0, 0)
+                os.chmod(dst, 0o644)
+                print('gpu:', os.path.relpath(dst, root))
+            continue
         if not os.path.isfile(path):
             continue
         dst = os.path.join(lib if name.endswith('.dylib') else bin_, name)

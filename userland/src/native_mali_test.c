@@ -9,15 +9,15 @@
 #include <stdint.h>
 #include <IOKit/IOKitLib.h>
 
-struct nm_q { uint32_t abi, in_bits, out_bits, flags; uint64_t max_bo; };
-struct nm_di { uint32_t gpu_id, sh_lo, sh_hi, ti_lo, ti_hi, thr, wg, bar, l2, core, tiler, flags; uint64_t va_start, va_size;
+struct q { uint32_t abi, in_bits, out_bits, flags; uint64_t max_bo; };
+struct di { uint32_t gpu_id, sh_lo, sh_hi, ti_lo, ti_hi, thr, wg, bar, l2, core, tiler, flags; uint64_t va_start, va_size;
 	uint32_t mem, mmu, afbc, tex[4], tasks, regs, tls, pgshift, vmops; };
-struct nm_bomap { uint64_t handle, iova; uint32_t perm, reserved; };
-struct nm_cpum { uint32_t token, reserved; uint64_t bytes; };
-struct nm_cpuu { uint64_t handle; uint32_t token, reserved; };
-struct nm_sub { uint64_t chain, wait_fence, wait_timeout; uint32_t flags, reserved; };
-struct nm_wait { uint64_t fence, timeout; };
-struct nm_stat { uint64_t faults, resets; };
+struct bomap { uint64_t handle, iova; uint32_t perm, reserved; };
+struct cpum { uint32_t token, reserved; uint64_t bytes; };
+struct cpuu { uint64_t handle; uint32_t token, reserved; };
+struct sub { uint64_t chain, wait_fence, wait_timeout; uint32_t flags, reserved; };
+struct wait { uint64_t fence, timeout; };
+struct stat2 { uint64_t faults, resets; };
 
 enum { QUERY = 1, INFO, ALLOC, MAP, FREE, CPUMAP, CPUUNMAP, SUBMIT, WAITF, STATUS, RESET };
 
@@ -60,14 +60,14 @@ write_job(volatile uint32_t *mem, uint64_t target, uint32_t value)
 	mem[12] = value;
 }
 
-struct nm_bo { uint64_t handle; uint64_t iova; volatile uint32_t *cpu; uint32_t token; };
+struct bo { uint64_t handle; uint64_t iova; volatile uint32_t *cpu; uint32_t token; };
 
 static int
-make_bo(io_connect_t c, uint64_t bytes, uint64_t iova, struct nm_bo *b)
+make_bo(io_connect_t c, uint64_t bytes, uint64_t iova, struct bo *b)
 {
 	uint64_t h = 0, mapped = 0;
-	struct nm_bomap m = { 0, iova, 3, 0 };
-	struct nm_cpum cm;
+	struct bomap m = { 0, iova, 3, 0 };
+	struct cpum cm;
 	uint64_t hin;
 	mach_vm_address_t addr = 0;
 	mach_vm_size_t len = 0;
@@ -86,13 +86,13 @@ int
 main(void)
 {
 	io_connect_t c = open_conn(), c2;
-	struct nm_q q = { 2, 0, 0, 0, 0 };
-	struct nm_di d;
-	struct nm_stat st0, st1;
-	struct nm_bo b, b2;
+	struct q q = { 2, 0, 0, 0, 0 };
+	struct di d;
+	struct stat2 st0, st1;
+	struct bo b, b2;
 	uint64_t fence = 0, bytes = 16384;
-	struct nm_sub s;
-	struct nm_wait w;
+	struct sub s;
+	struct wait w;
 	int r;
 
 	if (c == 0) {
@@ -133,13 +133,13 @@ main(void)
 		w.fence = 0x7777777777ull;
 		CHECK(call(c, WAITF, &w, sizeof(w), NULL, 0) != 0, "WaitFence refuses a fence never issued");
 		{
-			struct nm_bomap again = { b.handle, 0x05000000, 3, 0 };
+			struct bomap again = { b.handle, 0x05000000, 3, 0 };
 			uint64_t out;
 			CHECK(call(c, MAP, &again, sizeof(again), &out, sizeof(out)) != 0, "BoMap refuses a buffer already mapped");
 		}
 		{
 			uint64_t h2 = 0, bytes2 = 4096, out;
-			struct nm_bomap over;
+			struct bomap over;
 			call(c, ALLOC, &bytes2, sizeof(bytes2), &h2, sizeof(h2));
 			over.handle = h2; over.iova = b.iova + 4096; over.perm = 3; over.reserved = 0;
 			CHECK(call(c, MAP, &over, sizeof(over), &out, sizeof(out)) != 0, "BoMap refuses an overlap");
@@ -175,7 +175,7 @@ main(void)
 	CHECK(call(c, STATUS, NULL, 0, &st1, sizeof(st1)) == 0 && st1.faults == st0.faults, "no GPU faults during the run");
 	printf("      faults %llu resets %llu\n", (unsigned long long)st1.faults, (unsigned long long)st1.resets);
 	if (r == 0) {
-		struct nm_cpuu cu = { b.handle, b.token, 0 };
+		struct cpuu cu = { b.handle, b.token, 0 };
 
 		CHECK(call(c, CPUUNMAP, &cu, sizeof(cu), NULL, 0) == 0, "BoCpuUnmap");
 		CHECK(call(c, FREE, &b.handle, sizeof(b.handle), NULL, 0) == 0, "BoFree");
