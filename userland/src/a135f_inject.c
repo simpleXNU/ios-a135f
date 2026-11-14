@@ -45,6 +45,17 @@
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 static uintptr_t slide;
 
+typedef kern_return_t (*IORegistryEntrySetCFProperties_fn)(
+    io_registry_entry_t entry, CFTypeRef properties);
+
+static IORegistryEntrySetCFProperties_fn load_set_cf_properties(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "IORegistryEntrySetCFProperties");
+    if (!sym) {
+        fprintf(stderr, "dlsym IORegistryEntrySetCFProperties: %s\n", dlerror());
+    }
+    return (IORegistryEntrySetCFProperties_fn)sym;
+}
+
 static void
 say(const char *format, ...)
 {
@@ -636,6 +647,8 @@ name_the_driver(void)
 	io_service_t accelerator = IOServiceGetMatchingService(0, IOServiceMatching("IOAcceleratorES"));
 	const void *keys[2] = { CFSTR("MetalPluginName"), CFSTR("MetalPluginClassName") };
 	const void *values[2] = { CFSTR("A135FMetal"), CFSTR("A135FMetalDevice") };
+	IORegistryEntrySetCFProperties_fn setcfprops = load_set_cf_properties();
+	if (!setcfprops) return 1;
 	CFDictionaryRef properties;
 	kern_return_t kr;
 
@@ -644,7 +657,9 @@ name_the_driver(void)
 		return 0;
 	}
 	properties = CFDictionaryCreate(NULL, keys, values, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	kr = IORegistryEntrySetCFProperties(accelerator, properties);
+//	kr = IORegistryEntrySetCFProperties(accelerator, properties);
+	kr = setcfprops(accelerator, properties);
+
 	CFRelease(properties);
 	IOObjectRelease(accelerator);
 	if (kr != KERN_SUCCESS) {
